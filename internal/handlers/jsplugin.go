@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -310,6 +311,10 @@ func (h *JSPluginHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.rejectIfDeleting(w, r, pluginID) {
+		return
+	}
+
 	// 限制上传大小 50MB
 	r.Body = http.MaxBytesReader(w, r.Body, 50<<20)
 
@@ -333,6 +338,10 @@ func (h *JSPluginHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	plugin, err := h.packageMgr.Update(pluginID, zipData)
 	if err != nil {
+		if errors.Is(err, jsplugin.ErrPluginUninstalling) {
+			respondError(w, http.StatusConflict, "插件正在删除中，暂不能更新，请在删除完成后重新安装", err)
+			return
+		}
 		respondError(w, http.StatusBadRequest, "更新插件失败", err)
 		return
 	}
@@ -351,16 +360,18 @@ func (h *JSPluginHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 // handleDelete 删除插件
 // @Summary 删除 JS 插件
-// @Description 根据插件ID删除 JS 插件。可通过 keep_data 参数保留插件数据目录（文件系统存储），持久化存储（数据库）始终保留。
+// @Description 根据插件ID两阶段删除 JS 插件：先立即阻断新请求、懒加载、健康恢复、热更新与自动更新，排空已排队和运行中的调用，再关闭定时器、后台进程、WebSocket 与脚本环境；排空或停止失败返回 503/500 且不删除任何文件。随后原子落盘删除墓碑，再删除 ZIP、数据目录（keep_data=true 保留，默认删除）与数据库记录；部分失败或进程中断后，下次启动会依据墓碑继续收敛为完整删除。持久化存储（plugin_storage 表）始终保留。删除成功后该插件的 publicPaths、歌词/封面提供者、播放订阅、调度任务与健康检查全部注销，同一 entryPath 可重新安装。
 // @Tags JS插件管理
 // @Accept json
 // @Produce json
 // @Param id path int true "插件ID"
-// @Param keep_data query string false "是否保留插件数据目录（true/false，默认 false）"
+// @Param keep_data query string false "是否保留插件数据目录（true/false，默认 false；宿主数据库中的 plugin_storage 始终保留）"
 // @Success 200 {object} map[string]interface{} "删除成功"
 // @Failure 401 {object} models.ErrorResponse "未授权"
 // @Failure 404 {object} models.ErrorResponse "插件不存在"
-// @Failure 500 {object} models.ErrorResponse "服务器错误"
+// @Failure 409 {object} models.ErrorResponse "插件正在删除中"
+// @Failure 503 {object} models.ErrorResponse "插件仍在处理请求，删除已中止，未删除任何文件"
+// @Failure 500 {object} models.ErrorResponse "停止服务或持久清理失败（墓碑保留，重启后继续收敛）"
 // @Security BearerAuth
 // @Router /jsplugins/{id} [delete]
 func (h *JSPluginHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -370,27 +381,30 @@ func (h *JSPluginHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 先检查插件是否存在，并卸载运行中的服务
-	plugin, err := h.repo.GetByID(r.Context(), pluginID)
-	if err != nil {
-		respondError(w, http.StatusNotFound, "插件不存在", err)
-		return
-	}
-
-	// 卸载运行中的服务
-	if h.manager != nil {
-		_ = h.manager.UnloadPlugin(r.Context(), plugin.EntryPath)
-	}
-
-	// 执行卸载
 	keepData := r.URL.Query().Get("keep_data") == "true"
-	if err := h.packageMgr.Uninstall(pluginID, keepData); err != nil {
-		respondError(w, http.StatusInternalServerError, "删除插件失败", err)
-		return
-	}
 
-	if h.manager != nil {
-		h.manager.RefreshPublicPaths()
+	// Manager.DeletePlugin 两阶段完成删除：
+	//  1. 阻断新请求/懒加载/健康恢复/热更新/自动更新 → 排空在途调用 →
+	//     关闭定时器、后台进程、WebSocket 与脚本环境。排空或停服失败会返回
+	//     可观察错误，且 ZIP 与 DB 记录原样保留（不会出现仍在运行的半卸载）。
+	//  2. 落盘删除墓碑后删除 ZIP、数据目录（keep_data=true 保留）与 DB 记录；
+	//     部分失败或进程中断由下次启动继续收敛。
+	plugin, err := h.manager.DeletePlugin(r.Context(), pluginID, keepData)
+	if err != nil {
+		switch {
+		case errors.Is(err, database.ErrNotFound):
+			respondError(w, http.StatusNotFound, "插件不存在", err)
+		case jsplugin.IsPluginUninstallingError(err):
+			respondError(w, http.StatusConflict, "插件正在删除中，请勿重复操作", err)
+		case errors.Is(err, jsplugin.ErrDrainTimeout):
+			respondError(w, http.StatusServiceUnavailable,
+				"插件仍在处理请求，删除已中止（未删除任何文件），请稍后重试", err)
+		default:
+			// 调度器注销 / 脚本环境停止失败，或持久收敛阶段失败（墓碑保留，
+			// 服务重启时继续删除）。原样返回错误，便于管理员观察与重试。
+			respondError(w, http.StatusInternalServerError, "删除插件失败", err)
+		}
+		return
 	}
 
 	// 清理底部导航 Tab 配置中该插件的条目，防止孤儿条目永久占名额（#416）
@@ -599,6 +613,10 @@ func (h *JSPluginHandler) handleDownloadUpdate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	if h.rejectIfDeleting(w, r, pluginID) {
+		return
+	}
+
 	// 允许 body 为空（不使用代理）
 	var req struct {
 		GithubProxy string `json:"github_proxy"`
@@ -610,6 +628,10 @@ func (h *JSPluginHandler) handleDownloadUpdate(w http.ResponseWriter, r *http.Re
 
 	plugin, err := h.packageMgr.DownloadUpdate(pluginID, req.GithubProxy, req.Force)
 	if err != nil {
+		if errors.Is(err, jsplugin.ErrPluginUninstalling) {
+			respondError(w, http.StatusConflict, "插件正在删除中，暂不能更新，请在删除完成后重新安装", err)
+			return
+		}
 		respondError(w, http.StatusInternalServerError, "下载更新失败", err)
 		return
 	}
@@ -750,6 +772,24 @@ func (h *JSPluginHandler) handleCleanupOrphanStorage(w http.ResponseWriter, r *h
 		"message": fmt.Sprintf("已清理 %d 个插件的孤儿数据", cleaned),
 		"cleaned": cleaned,
 	})
+}
+
+// rejectIfDeleting 在更新类操作前检查插件是否正处于删除流程，是则写 409 并返回 true。
+// 删除窗口内覆盖 ZIP/触发热重载会与排空、墓碑收敛竞争，必须提前拒绝。
+func (h *JSPluginHandler) rejectIfDeleting(w http.ResponseWriter, r *http.Request, pluginID int64) bool {
+	if h.manager == nil {
+		return false
+	}
+	existing, err := h.repo.GetByID(r.Context(), pluginID)
+	if err != nil || existing == nil {
+		// 不存在的情况交给后续操作按既有 404 语义处理。
+		return false
+	}
+	if h.manager.IsPluginDeleting(existing.EntryPath) {
+		respondError(w, http.StatusConflict, "插件正在删除中，请勿重复操作", jsplugin.ErrPluginDeleting)
+		return true
+	}
+	return false
 }
 
 // parseID 从 URL 参数解析插件 ID

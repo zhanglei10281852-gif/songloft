@@ -416,7 +416,12 @@ func (s *JSService) Deinit() error {
 	return nil
 }
 
-// Stop 停止服务（Deinit + 销毁 JS 环境）
+// Stop 停止服务（停定时器 → Deinit → 桥接资源清理 → 销毁 JS 环境）。
+//
+// 每一步都会执行，不因前一步出错而跳过，避免后台进程/socket/VM 泄漏。
+// 错误语义：onDeinit 抛错与桥接资源关闭错误只记日志（插件回调失败不代表
+// 仍在运行，资源关闭均为幂等 best-effort）；唯独脚本环境销毁失败向上返回——
+// 删除流程据此中止破坏性操作，不能在 VM 可能仍存活时删包删库。
 func (s *JSService) Stop() error {
 	s.mu.Lock()
 	if s.status == ServiceStatusStopped {
@@ -431,16 +436,19 @@ func (s *JSService) Stop() error {
 	// 调用 deinit（忽略错误，确保后续清理继续）
 	_ = s.Deinit()
 
-	// 清理桥接处理器资源（终止后台进程等）
+	// 清理桥接处理器资源（终止后台进程、关闭 UDP/TCP socket、HTTP 流、
+	// 入站 WebSocket；内部等待各 readLoop 退出）
 	if s.bridgeHandler != nil {
 		s.bridgeHandler.Cleanup()
 	}
 
 	// 销毁 JS 环境（包含本插件创建的所有子 env，例如 songloft.jsenv.create 的）
 	// DestroyPluginEnvs 按 pluginID 批量回收，root env 也在其中。
+	var stopErr error
 	if s.plugin != nil {
 		if err := s.jsManager.DestroyPluginEnvs(s.plugin.ID); err != nil {
 			slog.Warn("destroy plugin envs failed", "plugin", s.plugin.EntryPath, "error", err)
+			stopErr = fmt.Errorf("destroy plugin envs: %w", err)
 		}
 	}
 
@@ -449,7 +457,7 @@ func (s *JSService) Stop() error {
 	s.mu.Unlock()
 
 	slog.Info("JS plugin stopped", "plugin", s.plugin.EntryPath)
-	return nil
+	return stopErr
 }
 
 // armTimerStop 取得（必要时创建）定时器 goroutine 的停止信号。

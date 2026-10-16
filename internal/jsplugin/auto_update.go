@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
 
@@ -91,6 +92,14 @@ func (m *Manager) RunUpdateAllWithOptions(ctx context.Context, githubProxy strin
 			CurrentVersion: plugin.Version,
 		}
 
+		// 删除流程中的插件跳过：不检查更新、不下载覆盖 ZIP、不触发重载，
+		// 避免与墓碑收敛竞争。
+		if m.isDeleting(plugin.EntryPath) {
+			result.Skipped++
+			result.Results = append(result.Results, item)
+			continue
+		}
+
 		if plugin.UpdateURL == "" {
 			result.Skipped++
 			result.Results = append(result.Results, item)
@@ -167,14 +176,26 @@ func (m *Manager) RunUpdateAllWithOptions(ctx context.Context, githubProxy strin
 type AutoUpdater struct {
 	manager *Manager
 	// pendingReload 记录"新版本已落盘、但当时插件正忙所以没重载"的插件 entryPath。
-	// 只在 Run 的 goroutine 里读写（runOnce / retryPendingReloads 都由同一个 select 驱动），
-	// 因此不需要加锁。
+	// 由 Run 的 goroutine（runOnce / retryPendingReloads）读写；插件删除流程
+	// 会从 HTTP 请求 goroutine 调 ForgetPending，因此用 pendingMu 保护。
 	pendingReload map[string]struct{}
+	pendingMu     sync.Mutex
 }
 
 // NewAutoUpdater 创建自动更新调度器。
 func NewAutoUpdater(m *Manager) *AutoUpdater {
 	return &AutoUpdater{manager: m, pendingReload: make(map[string]struct{})}
+}
+
+// ForgetPending 清除该插件被推迟的重载待办。插件删除成功后调用，
+// 避免下一个重试周期对着已删除的记录刷错误日志。
+func (a *AutoUpdater) ForgetPending(entryPath string) {
+	if a == nil {
+		return
+	}
+	a.pendingMu.Lock()
+	delete(a.pendingReload, entryPath)
+	a.pendingMu.Unlock()
 }
 
 // Run 阻塞运行自动更新循环，直到 ctx 取消。应在独立 goroutine 中调用。
@@ -210,7 +231,15 @@ func (a *AutoUpdater) Run(ctx context.Context) {
 // retryPendingReloads 重试因插件忙而推迟的热重载：仍然忙就继续等下一个周期。
 func (a *AutoUpdater) retryPendingReloads(ctx context.Context) {
 	m := a.manager
+
+	a.pendingMu.Lock()
+	pending := make([]string, 0, len(a.pendingReload))
 	for entryPath := range a.pendingReload {
+		pending = append(pending, entryPath)
+	}
+	a.pendingMu.Unlock()
+
+	for _, entryPath := range pending {
 		if busy, reason := m.IsPluginBusy(entryPath); busy {
 			slog.Debug("deferred reload still pending, plugin busy", "entryPath", entryPath, "reason", reason)
 			continue
@@ -222,8 +251,11 @@ func (a *AutoUpdater) retryPendingReloads(ctx context.Context) {
 			slog.Info("deferred reload after update completed", "entryPath", entryPath)
 		}
 		// 成功失败都出队：失败通常是插件本身的问题，每 10 分钟重试只会刷日志。
-		// 交给 HealthChecker 的自愈与下一轮自动更新处理。
+		// 交给 HealthChecker 的自愈与下一轮自动更新处理。删除中的插件也在此
+		// 出队（DeletePlugin 的 ForgetPending 通常已先一步清掉）。
+		a.pendingMu.Lock()
 		delete(a.pendingReload, entryPath)
+		a.pendingMu.Unlock()
 	}
 }
 
@@ -252,9 +284,11 @@ func (a *AutoUpdater) runOnce(ctx context.Context) {
 		slog.Warn("auto-update run failed", "error", err)
 		return
 	}
+	a.pendingMu.Lock()
 	for _, entryPath := range result.PendingReload {
 		a.pendingReload[entryPath] = struct{}{}
 	}
+	a.pendingMu.Unlock()
 	slog.Info("auto-update completed",
 		"total", result.Total,
 		"updated", result.Updated,

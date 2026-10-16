@@ -39,6 +39,11 @@ func (h *HotReloader) ReloadPlugin(ctx context.Context, pluginID int64) error {
 	entryPath := plugin.EntryPath
 	slog.Info("hot reload plugin started", "plugin", entryPath, "id", pluginID)
 
+	// 删除流程中的插件不得热更新（文件监控 mtime 抖动等）。
+	if h.manager.isDeleting(entryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
+	}
+
 	// 获取旧服务（如果存在）
 	oldService, hasOld := h.manager.GetService(entryPath)
 

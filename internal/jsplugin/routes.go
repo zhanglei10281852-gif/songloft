@@ -250,6 +250,11 @@ func (m *Manager) RegisterAPIRoutes(r chi.Router) {
 // @Router /jsplugin/{entryPath} [get]
 func (m *Manager) handlePluginStatic(w http.ResponseWriter, r *http.Request) {
 	entryPath := chi.URLParam(r, "entryPath")
+	// 删除开始后公开页面立即不可达，不等磁盘目录被删掉。
+	if m.isDeleting(entryPath) {
+		http.Error(w, "plugin not found", http.StatusNotFound)
+		return
+	}
 	staticRoot := filepath.Join(m.pluginsDataDir, entryPath, "static")
 	absStaticRoot, err := filepath.Abs(staticRoot)
 	if err != nil {
@@ -326,6 +331,12 @@ func (m *Manager) handlePluginStaticSubdirFiles(w http.ResponseWriter, r *http.R
 func (m *Manager) handlePluginAPIRequest(w http.ResponseWriter, r *http.Request) {
 	entryPath := chi.URLParam(r, "entryPath")
 	subPath := chi.URLParam(r, "*")
+
+	// 删除开始后该插件的所有公开路径（含静态兜底页）立即 404。
+	if m.isDeleting(entryPath) {
+		m.writePluginUnavailable(w, r, entryPath, ErrPluginNotFound)
+		return
+	}
 
 	// 根路径（带尾部斜杠）：直接返回 static/index.html（不依赖 JS 运行时）
 	if subPath == "" {
@@ -424,6 +435,13 @@ func (m *Manager) writePluginUnavailable(w http.ResponseWriter, r *http.Request,
 //	GET /api/v1/jsplugin/{entryPath}/static              → static/index.html
 //	GET /api/v1/jsplugin/{entryPath}/static/some/route   → 未命中 → fallback 到 index.html
 func (m *Manager) servePluginStaticFile(w http.ResponseWriter, r *http.Request, entryPath, subPath string) {
+	// 删除开始后静态资源立即 404（handlePluginAPIRequest 的 static 兜底分支
+	// 已在入口拦截，这里覆盖 /static 与 /static/* 两条独立注册的路由）。
+	if m.isDeleting(entryPath) {
+		http.NotFound(w, r)
+		return
+	}
+
 	// 磁盘根目录：jsplugins_data/<entryPath>/static/
 	staticRoot := filepath.Join(m.pluginsDataDir, entryPath, "static")
 	absStaticRoot, err := filepath.Abs(staticRoot)
@@ -761,6 +779,12 @@ func (m *Manager) handlePluginFileServe(w http.ResponseWriter, r *http.Request) 
 	entryPath := chi.URLParam(r, "entryPath")
 	filePath := chi.URLParam(r, "*")
 
+	// 删除中的插件不再放行文件直取（music://、相对数据目录等）。
+	if m.isDeleting(entryPath) {
+		http.NotFound(w, r)
+		return
+	}
+
 	if filePath == "" {
 		http.NotFound(w, r)
 		return
@@ -996,6 +1020,12 @@ func (m *Manager) RefreshPublicPaths() {
 
 // IsPublicPath 检查请求路径是否匹配某个插件的 publicPaths（供 AuthMiddleware 跳过认证）。
 func (m *Manager) IsPublicPath(path string) bool {
+	// 删除一旦开始，该插件的 publicPaths 立即失效（DB 记录删除 + RefreshPublicPaths
+	// 之间的窗口由这里兜住），避免免鉴权路径在排空期间仍放行新请求。
+	if m.isDeletingPluginPath(path) {
+		return false
+	}
+
 	m.mu.RLock()
 	prefixes := m.publicPathPrefixes
 	m.mu.RUnlock()
@@ -1006,4 +1036,22 @@ func (m *Manager) IsPublicPath(path string) bool {
 		}
 	}
 	return false
+}
+
+// isDeletingPluginPath 判断请求路径是否归属一个删除中的插件
+// （/api/v1/jsplugin/{entryPath} 及其任意子路径，含静态资源）。
+func (m *Manager) isDeletingPluginPath(path string) bool {
+	const prefix = "/api/v1/jsplugin/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	rest := path[len(prefix):]
+	entryPath, _, ok := strings.Cut(rest, "/")
+	if !ok {
+		entryPath = rest // 无尾斜杠的插件根路径
+	}
+	if entryPath == "" {
+		return false
+	}
+	return m.isDeleting(entryPath)
 }

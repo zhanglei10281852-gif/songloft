@@ -2486,14 +2486,16 @@ paths:
     delete:
       consumes:
       - application/json
-      description: 根据插件ID删除 JS 插件。可通过 keep_data 参数保留插件数据目录（文件系统存储），持久化存储（数据库）始终保留。
+      description: 根据插件ID两阶段删除 JS 插件：先立即阻断新请求、懒加载、健康恢复、热更新与自动更新，排空已排队和运行中的调用，再关闭定时器、后台进程、WebSocket
+        与脚本环境；排空或停止失败返回 503/500 且不删除任何文件。随后原子落盘删除墓碑，再删除 ZIP、数据目录（keep_data=true 保留，默认删除）与数据库记录；部分失败或进程中断后，下次启动会依据墓碑继续收敛为完整删除。持久化存储（plugin_storage
+        表）始终保留。删除成功后该插件的 publicPaths、歌词/封面提供者、播放订阅、调度任务与健康检查全部注销，同一 entryPath 可重新安装。
       parameters:
       - description: 插件ID
         in: path
         name: id
         required: true
         type: integer
-      - description: 是否保留插件数据目录（true/false，默认 false）
+      - description: 是否保留插件数据目录（true/false，默认 false；宿主数据库中的 plugin_storage 始终保留）
         in: query
         name: keep_data
         type: string
@@ -2513,8 +2515,16 @@ paths:
           description: 插件不存在
           schema:
             $ref: '#/definitions/models.ErrorResponse'
+        "409":
+          description: 插件正在删除中
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
         "500":
-          description: 服务器错误
+          description: 停止服务或持久清理失败（墓碑保留，重启后继续收敛）
+          schema:
+            $ref: '#/definitions/models.ErrorResponse'
+        "503":
+          description: 插件仍在处理请求，删除已中止，未删除任何文件
           schema:
             $ref: '#/definitions/models.ErrorResponse'
       security:

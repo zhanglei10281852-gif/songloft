@@ -182,6 +182,12 @@ func (hc *HealthChecker) runChecks(ctx context.Context) {
 		default:
 		}
 
+		// 删除流程中的服务整轮跳过：不探测、不空闲驱逐、不写 error 状态，
+		// 避免与停服/删库竞争（ListServices 是快照，删除可能在快照之后发生）。
+		if hc.manager.isDeleting(svc.Name()) {
+			continue
+		}
+
 		// 先检查空闲状态
 		if hc.checkIdle(svc) {
 			continue
@@ -459,6 +465,11 @@ func (hc *HealthChecker) runWakeupChecks(ctx context.Context) {
 		default:
 		}
 
+		// 删除流程中不再唤醒（计划也已在 Forget 中清除，这是双保险）。
+		if hc.manager.isDeleting(entryPath) {
+			continue
+		}
+
 		// 已被其他路径加载（懒加载/手动 enable）则跳过
 		if _, ok := hc.manager.GetService(entryPath); ok {
 			continue
@@ -493,6 +504,18 @@ func (hc *HealthChecker) ClearRecovery(entryPath string) {
 	hc.mu.Unlock()
 }
 
+// Forget 清除该插件在健康检查器中的全部计划与计数：唤醒计划、自愈退避、
+// 连续失败与 Busy 计数。插件删除流程在停服后调用，确保删除期间不会有任何
+// 健康检查侧的后台动作重新进入该插件。
+func (hc *HealthChecker) Forget(entryPath string) {
+	hc.mu.Lock()
+	delete(hc.failures, entryPath)
+	delete(hc.busyHits, entryPath)
+	delete(hc.recoveries, entryPath)
+	delete(hc.wakeupSchedule, entryPath)
+	hc.mu.Unlock()
+}
+
 // runRecoveryAttempts 扫描 DB 中 status=error 的插件，对到达退避窗口的尝试 LoadPlugin。
 //
 // 行为：
@@ -510,6 +533,10 @@ func (hc *HealthChecker) runRecoveryAttempts(ctx context.Context) {
 	now := time.Now()
 	for _, plugin := range plugins {
 		if plugin.Status != JSPluginStatusError {
+			continue
+		}
+		// 删除流程中不得自愈：墓碑收敛后记录会消失，重试加载只会与删包竞争。
+		if hc.manager.isDeleting(plugin.EntryPath) {
 			continue
 		}
 

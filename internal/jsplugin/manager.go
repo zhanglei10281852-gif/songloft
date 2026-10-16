@@ -68,6 +68,13 @@ type Manager struct {
 	loadGroup            singleflight.Group
 	publicPathPrefixes   []string // 无需 JWT 的路径前缀（通过 RefreshPublicPaths 从 DB 加载，运行时可刷新）
 	playEventSubscribers sync.Map // 已订阅播放事件的插件 entryPath 集合
+	// deleting 标记删除流程进行中的插件 entryPath。标记后新请求/懒加载/健康
+	// 恢复/热更新/自动更新一律不得再进入该插件，直到删除成功收敛或失败回滚。
+	// 详见 DeletePlugin。
+	deleting sync.Map
+	// 删除排空 / 注销等待预算，零值使用默认常量；测试可改短。
+	drainTimeout      time.Duration
+	unregisterTimeout time.Duration
 	// lyricProviders 记录声明了歌词提供能力的插件 entryPath 集合。
 	// 语义是"已知歌词提供者"而非"当前已加载"：插件被空闲驱逐(UnloadPlugin)时**不**从此集合移除，
 	// 否则驱逐后 SearchLyrics 遍历到空集合会直接短路，永远无法懒加载唤醒插件(#303)。
@@ -81,9 +88,10 @@ type Manager struct {
 
 // NewManager 创建 JS 插件管理器
 func NewManager(repo Repository, pluginsDir, pluginsDataDir, basePath string, router chi.Router, db database.DB) *Manager {
+	packager := NewPackageManager(pluginsDir, pluginsDataDir, repo)
 	m := &Manager{
 		repo:           repo,
-		packager:       NewPackageManager(pluginsDir, pluginsDataDir, repo),
+		packager:       packager,
 		scheduler:      NewServiceScheduler(1),
 		jsManager:      jsruntime.NewJSEnvManager(),
 		pluginsDir:     pluginsDir,
@@ -92,6 +100,13 @@ func NewManager(repo Repository, pluginsDir, pluginsDataDir, basePath string, ro
 		router:         router,
 		db:             db,
 	}
+	// 删除阶段 1（墓碑落盘前的排空窗口）内，上传/更新/商店安装不得覆盖 ZIP。
+	packager.SetInstallGuard(func(entryPath string) error {
+		if m.isDeleting(entryPath) {
+			return fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
+		}
+		return nil
+	})
 	return m
 }
 
@@ -211,10 +226,21 @@ func (m *Manager) Start(ctx context.Context) error {
 	internalCtx, cancel := context.WithCancel(ctx)
 	m.cancelFunc = cancel
 
+	// 先收敛上次删除中残留的墓碑（进程在删除 ZIP/数据目录/DB 记录任一阶段
+	// 崩溃，或某步失败）。必须在目录扫描之前完成：残留 ZIP 一旦被 Sync 当成
+	// 新插件自动安装，就会出现「记录已删却复活」；残留 active 记录没了包也
+	// 要在这里删记录，而不是等孤儿清理用错误的 keep_data 语义处理。
+	if recovered, err := m.packager.RecoverPendingUninstalls(); err != nil {
+		slog.Error("recover pending js plugin uninstalls failed", "error", err)
+	} else if len(recovered) > 0 {
+		slog.Info("recovered pending js plugin uninstalls", "count", len(recovered))
+	}
+
 	// 从本地 zip 文件同步插件记录：
 	//   - 新发现 zip → InstallFromUpload（强制 manifest hash 校验）
 	//   - 已有记录但 zipHash 不一致 → Update（重新计算规范化 hash）
 	//   - 数据库有但 zip 文件不在 → 删除孤儿记录
+	//   - 带未收敛墓碑的 entryPath → 跳过，交给下一轮恢复
 	// SyncPluginsFromDirectory 返回完整的插件列表，直接复用，
 	// 避免再次调用 repo.GetAll() 引发与 WASM 插件管理器的 SQLITE_BUSY 锁竞争。
 	synced, err := m.packager.SyncPluginsFromDirectory()
@@ -295,8 +321,19 @@ func (m *Manager) loadPlugins(ctx context.Context, plugins []*JSPlugin) {
 // LoadPlugin 的 follower 则会拿到 ErrPluginDisabled 之类而误判失败。
 // 见 load_race_test.go。
 func (m *Manager) LoadPlugin(ctx context.Context, plugin *JSPlugin) error {
+	// 删除流程中禁止任何形式的加载（懒加载、健康自愈唤醒、热更新/自动更新
+	// 重载），否则刚排空停服的插件可能在删包前被重新拉起。
+	if m.isDeleting(plugin.EntryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// 持锁后再查一次：删除流程可能在上面的无锁检查之后拿到 m.mu 先行。
+	if m.isDeleting(plugin.EntryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
+	}
 
 	// 幂等：已加载就直接成功返回。JS 环境的 envID 全局唯一，重复创建必然失败，
 	// 而"已经加载好了"本身不是错误——热更新/Enable 等需要真正重载的路径都会先 UnloadPlugin。
@@ -416,6 +453,11 @@ func (m *Manager) UnloadPlugin(ctx context.Context, entryPath string) error {
 
 // ReloadPlugin 重载插件（unload + 清除字节码缓存 + load）
 func (m *Manager) ReloadPlugin(ctx context.Context, entryPath string) error {
+	// 删除中的插件不得被热更新/自动更新/上传更新重新拉起。
+	if m.isDeleting(entryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
+	}
+
 	// 先获取插件信息
 	plugin, err := m.repo.GetByEntryPath(ctx, entryPath)
 	if err != nil {
@@ -442,6 +484,10 @@ func (m *Manager) EnablePlugin(ctx context.Context, id int64) error {
 	plugin, err := m.repo.GetByID(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get plugin by id %d: %w", id, err)
+	}
+
+	if m.isDeleting(plugin.EntryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
 	}
 
 	// 先卸载可能残留的旧环境（如从 error 状态重新启用时）
@@ -474,6 +520,10 @@ func (m *Manager) DisablePlugin(ctx context.Context, id int64) error {
 	plugin, err := m.repo.GetByID(ctx, id)
 	if err != nil {
 		return fmt.Errorf("get plugin by id %d: %w", id, err)
+	}
+
+	if m.isDeleting(plugin.EntryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
 	}
 
 	// 卸载插件
@@ -532,6 +582,12 @@ func (m *Manager) IsPluginBusy(entryPath string) (bool, string) {
 // 并发去重：用 singleflight 按 entryPath 合并同时进入的多次 LoadPlugin，
 // 防止 50 个请求并发触发空闲驱逐插件时同时跑 50 次 hash 校验/scheduler 注册。
 func (m *Manager) EnsureLoaded(ctx context.Context, entryPath string) (*JSService, error) {
+	// 删除一旦开始，所有公开路由立即不可达：直接按「不存在」拒绝（404），
+	// 不进入懒加载，也不返回缓存的旧 service（排空期间它可能还在 map 中）。
+	if m.isDeleting(entryPath) {
+		return nil, ErrPluginNotFound
+	}
+
 	// 快速路径：已加载直接返回。
 	if svc, ok := m.GetService(entryPath); ok {
 		return svc, nil
@@ -544,9 +600,16 @@ func (m *Manager) EnsureLoaded(ctx context.Context, entryPath string) (*JSServic
 			return svc, nil
 		}
 
+		// 排队 singleflight 期间删除开始：按不存在拒绝，不做懒加载。
+		if m.isDeleting(entryPath) {
+			return nil, ErrPluginNotFound
+		}
+
 		plugin, err := m.repo.GetByEntryPath(ctx, entryPath)
 		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
+			// 仓储层把未命中归一为 database.ErrNotFound；部分直连路径仍可能给
+			// sql.ErrNoRows，两者都按「插件不存在」处理（路由映射 404）。
+			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, database.ErrNotFound) {
 				return nil, ErrPluginNotFound
 			}
 			return nil, fmt.Errorf("get plugin by entry_path %q: %w", entryPath, err)

@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 空闲插件删除成功后，其运行服务、数据库记录、安装 ZIP、静态资源和动态路由均消失，同一 entryPath 可再次安装。
+  - id: 2
+    type: f2p
+    text: 存在排队或运行中的 HTTP、定时任务和设备连接时，删除会先拒绝新工作并排空或取消旧工作，成功后不残留进程、timer、WebSocket 或脚本回调。
+  - id: 3
+    type: f2p
+    text: 调度器注销或插件服务停止失败时返回可观察错误，并且不会继续删除安装包、目录或数据库记录，插件可恢复为完整可用状态。
+  - id: 4
+    type: f2p
+    text: ZIP、静态目录、数据目录或数据库删除失败以及各删除阶段的进程中断，都能在重启后继续确定收敛，不出现 active 无包或残留包被重新安装。
+  - id: 5
+    type: f2p
+    text: EnsureLoaded、健康检查、热更新或自动更新与删除并发时不能重新加载或复活处于删除过程中的插件。
+  - id: 6
+    type: f2p
+    text: 删除成功后 publicPaths、歌词和封面提供者、播放订阅及调度能力立即不可用，不再留下免认证路径或后台回调。
+  - id: 7
+    type: p2p
+    text: keep_data 为 true 时保留插件数据目录，默认 false 时仍删除该目录，persistent storage 的卸载后保留语义和正常安装、启用、禁用流程不回归。

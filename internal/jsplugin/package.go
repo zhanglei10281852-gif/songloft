@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +38,31 @@ type PackageManager struct {
 	pluginsDir string // data/jsplugins/ 存放 zip 的目录
 	dataDir    string // 插件数据目录（static 解压位置）
 	repo       Repository
+	// uninstallMu 串行化墓碑落盘与收敛删除，避免同 entryPath 的并发卸载
+	// （DELETE 重试 / 启动恢复）交错执行。
+	uninstallMu sync.Mutex
+	// installGuard 在写盘前对 entryPath 做同进程内存校验。Manager 注入它来
+	// 拦截删除阶段 1（墓碑尚未落盘的排空窗口）内的上传/更新/商店安装；
+	// 墓碑本身负责持久层（重启后）防护。nil 时跳过。
+	installGuard func(entryPath string) error
+}
+
+// SetInstallGuard 注入写盘前 entryPath 校验钩子（Manager 在构造时调用）。
+func (pm *PackageManager) SetInstallGuard(guard func(entryPath string) error) {
+	pm.installGuard = guard
+}
+
+// checkInstallGuard 统一执行内存 + 墓碑两层安装防护。
+func (pm *PackageManager) checkInstallGuard(entryPath string) error {
+	if pm.installGuard != nil {
+		if err := pm.installGuard(entryPath); err != nil {
+			return err
+		}
+	}
+	if pm.hasUninstallState(entryPath) {
+		return fmt.Errorf("%w: %s", ErrPluginUninstalling, entryPath)
+	}
+	return nil
 }
 
 // NewPackageManager 构造函数
@@ -94,6 +120,12 @@ func (pm *PackageManager) InstallFromUploadWithOptions(zipData []byte, opts Inst
 	// [2] 验证 manifest
 	if err := ValidateManifest(manifest); err != nil {
 		return nil, false, fmt.Errorf("validate manifest: %w", err)
+	}
+
+	// [2.1] 删除流程中（内存标记）或删除未收敛（墓碑仍在）时拒绝安装：
+	// 否则新 ZIP 可能在排空窗口覆盖旧包、或立刻被收敛流程删掉。
+	if err := pm.checkInstallGuard(manifest.EntryPath); err != nil {
+		return nil, false, err
 	}
 
 	// [3] 验证权限
@@ -249,6 +281,11 @@ func (pm *PackageManager) Update(pluginID int64, zipData []byte) (*JSPlugin, err
 		return nil, fmt.Errorf("entryPath mismatch: existing=%q, new=%q", existing.EntryPath, manifest.EntryPath)
 	}
 
+	// [5.1] 删除流程中（内存标记）或墓碑未收敛时拒绝覆盖更新。
+	if err := pm.checkInstallGuard(manifest.EntryPath); err != nil {
+		return nil, err
+	}
+
 	// [6] 读取入口文件并计算 hash（规范化 zip_hash 排除 plugin.json）。
 	entryContent, _, err := readEntryFromZip(zipData, manifest.Main)
 	if err != nil {
@@ -317,9 +354,23 @@ func (pm *PackageManager) Update(pluginID int64, zipData []byte) (*JSPlugin, err
 	return existing, nil
 }
 
-// Uninstall 卸载插件（删除 ZIP + 数据库记录，可选保留数据目录）
-// keepData=true 时仅删除 ZIP 和 DB 记录，保留插件数据目录
+// Uninstall 卸载插件（删除 ZIP + 数据库记录，可选保留数据目录）。
+//
+// 墓碑驱动的可恢复删除：先原子落盘删除意图（见 pluginUninstallState），再依次
+// 删除 ZIP、数据目录（keepData=true 保留）、DB 记录，全部成功后才删墓碑。
+// 任一步失败或进程中途崩溃，墓碑保留在磁盘，下次启动由
+// RecoverPendingUninstalls 继续收敛，不会留下「有记录没包」或「残留 ZIP 被
+// 重新扫描安装」的半卸载状态。
+//
+// 调用方（Manager.DeletePlugin）必须在调用前完成运行态阻断、排空与停服；
+// 本方法只负责持久状态与文件系统收敛。
+//
+// keepData=true 时保留插件数据目录（文件系统存储）；宿主 DB 中的
+// plugin_storage 始终沿用既有「卸载后保留」语义，不在此删除。
 func (pm *PackageManager) Uninstall(pluginID int64, keepData bool) error {
+	pm.uninstallMu.Lock()
+	defer pm.uninstallMu.Unlock()
+
 	ctx := context.Background()
 
 	// [1] 获取插件信息
@@ -328,23 +379,15 @@ func (pm *PackageManager) Uninstall(pluginID int64, keepData bool) error {
 		return fmt.Errorf("get plugin by id %d: %w", pluginID, err)
 	}
 
-	// [2] 删除 ZIP 文件
-	zipFilePath := filepath.Join(pm.pluginsDir, plugin.FilePath)
-	if err := os.Remove(zipFilePath); err != nil && !os.IsNotExist(err) {
-		slog.Warn("remove zip file failed", "path", zipFilePath, "error", err)
+	// [2] 破坏性操作前先持久化删除意图（已存在墓碑时幂等沿用）
+	state, err := pm.beginUninstall(plugin.EntryPath, plugin.FilePath, keepData)
+	if err != nil {
+		return fmt.Errorf("persist uninstall state: %w", err)
 	}
 
-	// [3] 删除数据目录（keepData=true 时跳过）
-	if !keepData {
-		staticDir := filepath.Join(pm.dataDir, plugin.EntryPath)
-		if err := os.RemoveAll(staticDir); err != nil {
-			slog.Warn("remove data dir failed", "path", staticDir, "error", err)
-		}
-	}
-
-	// [4] 删除数据库记录
-	if err := pm.repo.Delete(ctx, pluginID); err != nil {
-		return fmt.Errorf("delete plugin record: %w", err)
+	// [3] 按墓碑幂等收敛：ZIP → 数据目录 → DB 记录 → 墓碑
+	if err := pm.finishUninstall(ctx, state); err != nil {
+		return err
 	}
 
 	slog.Info("plugin uninstalled", "entryPath", plugin.EntryPath, "keepData", keepData)
@@ -379,6 +422,10 @@ func (pm *PackageManager) SyncPluginsFromDirectory() ([]*JSPlugin, error) {
 		dbMap[p.EntryPath] = p
 	}
 
+	// 未收敛的删除墓碑（正常流程下 RecoverPendingUninstalls 已在扫描前清掉；
+	// 这里是防御：收敛失败被保留的 ZIP 绝不能被当新插件重新安装）。
+	tombstones := pm.uninstallStateEntries()
+
 	var result []*JSPlugin
 
 	for _, entry := range entries {
@@ -391,6 +438,16 @@ func (pm *PackageManager) SyncPluginsFromDirectory() ([]*JSPlugin, error) {
 		}
 
 		entryPath := EntryPathFromZipName(name)
+
+		// 该 ZIP 属于一个尚未收敛的删除：保持删除意图，等下次恢复收敛，
+		// 不重新安装、不按 hash 更新。
+		if tombstones[entryPath] {
+			slog.Warn("skip zip with pending uninstall tombstone",
+				"file", name, "entryPath", entryPath)
+			delete(dbMap, entryPath) // 对应记录也交给收敛流程，不走下面的孤儿清理
+			continue
+		}
+
 		zipFilePath := filepath.Join(pm.pluginsDir, name)
 
 		if existing, ok := dbMap[entryPath]; ok {

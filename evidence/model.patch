@@ -1,0 +1,2271 @@
+diff --git a/docs/docs.go b/docs/docs.go
+index e67682e..3ca7ebe 100644
+--- a/docs/docs.go
++++ b/docs/docs.go
+@@ -1824,7 +1824,7 @@ const docTemplate = `{
+                         "BearerAuth": []
+                     }
+                 ],
+-                "description": "根据插件ID删除 JS 插件。可通过 keep_data 参数保留插件数据目录（文件系统存储），持久化存储（数据库）始终保留。",
++                "description": "根据插件ID两阶段删除 JS 插件：先立即阻断新请求、懒加载、健康恢复、热更新与自动更新，排空已排队和运行中的调用，再关闭定时器、后台进程、WebSocket 与脚本环境；排空或停止失败返回 503/500 且不删除任何文件。随后原子落盘删除墓碑，再删除 ZIP、数据目录（keep_data=true 保留，默认删除）与数据库记录；部分失败或进程中断后，下次启动会依据墓碑继续收敛为完整删除。持久化存储（plugin_storage 表）始终保留。删除成功后该插件的 publicPaths、歌词/封面提供者、播放订阅、调度任务与健康检查全部注销，同一 entryPath 可重新安装。",
+                 "consumes": [
+                     "application/json"
+                 ],
+@@ -1845,7 +1845,7 @@ const docTemplate = `{
+                     },
+                     {
+                         "type": "string",
+-                        "description": "是否保留插件数据目录（true/false，默认 false）",
++                        "description": "是否保留插件数据目录（true/false，默认 false；宿主数据库中的 plugin_storage 始终保留）",
+                         "name": "keep_data",
+                         "in": "query"
+                     }
+@@ -1870,8 +1870,20 @@ const docTemplate = `{
+                             "$ref": "#/definitions/models.ErrorResponse"
+                         }
+                     },
++                    "409": {
++                        "description": "插件正在删除中",
++                        "schema": {
++                            "$ref": "#/definitions/models.ErrorResponse"
++                        }
++                    },
+                     "500": {
+-                        "description": "服务器错误",
++                        "description": "停止服务或持久清理失败（墓碑保留，重启后继续收敛）",
++                        "schema": {
++                            "$ref": "#/definitions/models.ErrorResponse"
++                        }
++                    },
++                    "503": {
++                        "description": "插件仍在处理请求，删除已中止，未删除任何文件",
+                         "schema": {
+                             "$ref": "#/definitions/models.ErrorResponse"
+                         }
+diff --git a/docs/swagger.json b/docs/swagger.json
+index 1739389..c064b79 100644
+--- a/docs/swagger.json
++++ b/docs/swagger.json
+@@ -1818,7 +1818,7 @@
+                         "BearerAuth": []
+                     }
+                 ],
+-                "description": "根据插件ID删除 JS 插件。可通过 keep_data 参数保留插件数据目录（文件系统存储），持久化存储（数据库）始终保留。",
++                "description": "根据插件ID两阶段删除 JS 插件：先立即阻断新请求、懒加载、健康恢复、热更新与自动更新，排空已排队和运行中的调用，再关闭定时器、后台进程、WebSocket 与脚本环境；排空或停止失败返回 503/500 且不删除任何文件。随后原子落盘删除墓碑，再删除 ZIP、数据目录（keep_data=true 保留，默认删除）与数据库记录；部分失败或进程中断后，下次启动会依据墓碑继续收敛为完整删除。持久化存储（plugin_storage 表）始终保留。删除成功后该插件的 publicPaths、歌词/封面提供者、播放订阅、调度任务与健康检查全部注销，同一 entryPath 可重新安装。",
+                 "consumes": [
+                     "application/json"
+                 ],
+@@ -1839,7 +1839,7 @@
+                     },
+                     {
+                         "type": "string",
+-                        "description": "是否保留插件数据目录（true/false，默认 false）",
++                        "description": "是否保留插件数据目录（true/false，默认 false；宿主数据库中的 plugin_storage 始终保留）",
+                         "name": "keep_data",
+                         "in": "query"
+                     }
+@@ -1864,8 +1864,20 @@
+                             "$ref": "#/definitions/models.ErrorResponse"
+                         }
+                     },
++                    "409": {
++                        "description": "插件正在删除中",
++                        "schema": {
++                            "$ref": "#/definitions/models.ErrorResponse"
++                        }
++                    },
+                     "500": {
+-                        "description": "服务器错误",
++                        "description": "停止服务或持久清理失败（墓碑保留，重启后继续收敛）",
++                        "schema": {
++                            "$ref": "#/definitions/models.ErrorResponse"
++                        }
++                    },
++                    "503": {
++                        "description": "插件仍在处理请求，删除已中止，未删除任何文件",
+                         "schema": {
+                             "$ref": "#/definitions/models.ErrorResponse"
+                         }
+diff --git a/docs/swagger.yaml b/docs/swagger.yaml
+index cc55814..f794035 100644
+--- a/docs/swagger.yaml
++++ b/docs/swagger.yaml
+@@ -2486,14 +2486,16 @@ paths:
+     delete:
+       consumes:
+       - application/json
+-      description: 根据插件ID删除 JS 插件。可通过 keep_data 参数保留插件数据目录（文件系统存储），持久化存储（数据库）始终保留。
++      description: 根据插件ID两阶段删除 JS 插件：先立即阻断新请求、懒加载、健康恢复、热更新与自动更新，排空已排队和运行中的调用，再关闭定时器、后台进程、WebSocket
++        与脚本环境；排空或停止失败返回 503/500 且不删除任何文件。随后原子落盘删除墓碑，再删除 ZIP、数据目录（keep_data=true 保留，默认删除）与数据库记录；部分失败或进程中断后，下次启动会依据墓碑继续收敛为完整删除。持久化存储（plugin_storage
++        表）始终保留。删除成功后该插件的 publicPaths、歌词/封面提供者、播放订阅、调度任务与健康检查全部注销，同一 entryPath 可重新安装。
+       parameters:
+       - description: 插件ID
+         in: path
+         name: id
+         required: true
+         type: integer
+-      - description: 是否保留插件数据目录（true/false，默认 false）
++      - description: 是否保留插件数据目录（true/false，默认 false；宿主数据库中的 plugin_storage 始终保留）
+         in: query
+         name: keep_data
+         type: string
+@@ -2513,8 +2515,16 @@ paths:
+           description: 插件不存在
+           schema:
+             $ref: '#/definitions/models.ErrorResponse'
++        "409":
++          description: 插件正在删除中
++          schema:
++            $ref: '#/definitions/models.ErrorResponse'
+         "500":
+-          description: 服务器错误
++          description: 停止服务或持久清理失败（墓碑保留，重启后继续收敛）
++          schema:
++            $ref: '#/definitions/models.ErrorResponse'
++        "503":
++          description: 插件仍在处理请求，删除已中止，未删除任何文件
+           schema:
+             $ref: '#/definitions/models.ErrorResponse'
+       security:
+diff --git a/internal/handlers/jsplugin.go b/internal/handlers/jsplugin.go
+index 6318b45..0c02509 100644
+--- a/internal/handlers/jsplugin.go
++++ b/internal/handlers/jsplugin.go
+@@ -3,6 +3,7 @@ package handlers
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -310,6 +311,10 @@ func (h *JSPluginHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	if h.rejectIfDeleting(w, r, pluginID) {
++		return
++	}
++
+ 	// 限制上传大小 50MB
+ 	r.Body = http.MaxBytesReader(w, r.Body, 50<<20)
+ 
+@@ -333,6 +338,10 @@ func (h *JSPluginHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
+ 
+ 	plugin, err := h.packageMgr.Update(pluginID, zipData)
+ 	if err != nil {
++		if errors.Is(err, jsplugin.ErrPluginUninstalling) {
++			respondError(w, http.StatusConflict, "插件正在删除中，暂不能更新，请在删除完成后重新安装", err)
++			return
++		}
+ 		respondError(w, http.StatusBadRequest, "更新插件失败", err)
+ 		return
+ 	}
+@@ -351,16 +360,18 @@ func (h *JSPluginHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
+ 
+ // handleDelete 删除插件
+ // @Summary 删除 JS 插件
+-// @Description 根据插件ID删除 JS 插件。可通过 keep_data 参数保留插件数据目录（文件系统存储），持久化存储（数据库）始终保留。
++// @Description 根据插件ID两阶段删除 JS 插件：先立即阻断新请求、懒加载、健康恢复、热更新与自动更新，排空已排队和运行中的调用，再关闭定时器、后台进程、WebSocket 与脚本环境；排空或停止失败返回 503/500 且不删除任何文件。随后原子落盘删除墓碑，再删除 ZIP、数据目录（keep_data=true 保留，默认删除）与数据库记录；部分失败或进程中断后，下次启动会依据墓碑继续收敛为完整删除。持久化存储（plugin_storage 表）始终保留。删除成功后该插件的 publicPaths、歌词/封面提供者、播放订阅、调度任务与健康检查全部注销，同一 entryPath 可重新安装。
+ // @Tags JS插件管理
+ // @Accept json
+ // @Produce json
+ // @Param id path int true "插件ID"
+-// @Param keep_data query string false "是否保留插件数据目录（true/false，默认 false）"
++// @Param keep_data query string false "是否保留插件数据目录（true/false，默认 false；宿主数据库中的 plugin_storage 始终保留）"
+ // @Success 200 {object} map[string]interface{} "删除成功"
+ // @Failure 401 {object} models.ErrorResponse "未授权"
+ // @Failure 404 {object} models.ErrorResponse "插件不存在"
+-// @Failure 500 {object} models.ErrorResponse "服务器错误"
++// @Failure 409 {object} models.ErrorResponse "插件正在删除中"
++// @Failure 503 {object} models.ErrorResponse "插件仍在处理请求，删除已中止，未删除任何文件"
++// @Failure 500 {object} models.ErrorResponse "停止服务或持久清理失败（墓碑保留，重启后继续收敛）"
+ // @Security BearerAuth
+ // @Router /jsplugins/{id} [delete]
+ func (h *JSPluginHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
+@@ -370,27 +381,30 @@ func (h *JSPluginHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	// 先检查插件是否存在，并卸载运行中的服务
+-	plugin, err := h.repo.GetByID(r.Context(), pluginID)
+-	if err != nil {
+-		respondError(w, http.StatusNotFound, "插件不存在", err)
+-		return
+-	}
+-
+-	// 卸载运行中的服务
+-	if h.manager != nil {
+-		_ = h.manager.UnloadPlugin(r.Context(), plugin.EntryPath)
+-	}
+-
+-	// 执行卸载
+ 	keepData := r.URL.Query().Get("keep_data") == "true"
+-	if err := h.packageMgr.Uninstall(pluginID, keepData); err != nil {
+-		respondError(w, http.StatusInternalServerError, "删除插件失败", err)
+-		return
+-	}
+ 
+-	if h.manager != nil {
+-		h.manager.RefreshPublicPaths()
++	// Manager.DeletePlugin 两阶段完成删除：
++	//  1. 阻断新请求/懒加载/健康恢复/热更新/自动更新 → 排空在途调用 →
++	//     关闭定时器、后台进程、WebSocket 与脚本环境。排空或停服失败会返回
++	//     可观察错误，且 ZIP 与 DB 记录原样保留（不会出现仍在运行的半卸载）。
++	//  2. 落盘删除墓碑后删除 ZIP、数据目录（keep_data=true 保留）与 DB 记录；
++	//     部分失败或进程中断由下次启动继续收敛。
++	plugin, err := h.manager.DeletePlugin(r.Context(), pluginID, keepData)
++	if err != nil {
++		switch {
++		case errors.Is(err, database.ErrNotFound):
++			respondError(w, http.StatusNotFound, "插件不存在", err)
++		case jsplugin.IsPluginUninstallingError(err):
++			respondError(w, http.StatusConflict, "插件正在删除中，请勿重复操作", err)
++		case errors.Is(err, jsplugin.ErrDrainTimeout):
++			respondError(w, http.StatusServiceUnavailable,
++				"插件仍在处理请求，删除已中止（未删除任何文件），请稍后重试", err)
++		default:
++			// 调度器注销 / 脚本环境停止失败，或持久收敛阶段失败（墓碑保留，
++			// 服务重启时继续删除）。原样返回错误，便于管理员观察与重试。
++			respondError(w, http.StatusInternalServerError, "删除插件失败", err)
++		}
++		return
+ 	}
+ 
+ 	// 清理底部导航 Tab 配置中该插件的条目，防止孤儿条目永久占名额（#416）
+@@ -599,6 +613,10 @@ func (h *JSPluginHandler) handleDownloadUpdate(w http.ResponseWriter, r *http.Re
+ 		return
+ 	}
+ 
++	if h.rejectIfDeleting(w, r, pluginID) {
++		return
++	}
++
+ 	// 允许 body 为空（不使用代理）
+ 	var req struct {
+ 		GithubProxy string `json:"github_proxy"`
+@@ -610,6 +628,10 @@ func (h *JSPluginHandler) handleDownloadUpdate(w http.ResponseWriter, r *http.Re
+ 
+ 	plugin, err := h.packageMgr.DownloadUpdate(pluginID, req.GithubProxy, req.Force)
+ 	if err != nil {
++		if errors.Is(err, jsplugin.ErrPluginUninstalling) {
++			respondError(w, http.StatusConflict, "插件正在删除中，暂不能更新，请在删除完成后重新安装", err)
++			return
++		}
+ 		respondError(w, http.StatusInternalServerError, "下载更新失败", err)
+ 		return
+ 	}
+@@ -752,6 +774,24 @@ func (h *JSPluginHandler) handleCleanupOrphanStorage(w http.ResponseWriter, r *h
+ 	})
+ }
+ 
++// rejectIfDeleting 在更新类操作前检查插件是否正处于删除流程，是则写 409 并返回 true。
++// 删除窗口内覆盖 ZIP/触发热重载会与排空、墓碑收敛竞争，必须提前拒绝。
++func (h *JSPluginHandler) rejectIfDeleting(w http.ResponseWriter, r *http.Request, pluginID int64) bool {
++	if h.manager == nil {
++		return false
++	}
++	existing, err := h.repo.GetByID(r.Context(), pluginID)
++	if err != nil || existing == nil {
++		// 不存在的情况交给后续操作按既有 404 语义处理。
++		return false
++	}
++	if h.manager.IsPluginDeleting(existing.EntryPath) {
++		respondError(w, http.StatusConflict, "插件正在删除中，请勿重复操作", jsplugin.ErrPluginDeleting)
++		return true
++	}
++	return false
++}
++
+ // parseID 从 URL 参数解析插件 ID
+ func (h *JSPluginHandler) parseID(r *http.Request) (int64, error) {
+ 	idStr := chi.URLParam(r, "id")
+diff --git a/internal/jsplugin/auto_update.go b/internal/jsplugin/auto_update.go
+index af015ff..0fdaa82 100644
+--- a/internal/jsplugin/auto_update.go
++++ b/internal/jsplugin/auto_update.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"log/slog"
++	"sync"
+ 	"time"
+ )
+ 
+@@ -91,6 +92,14 @@ func (m *Manager) RunUpdateAllWithOptions(ctx context.Context, githubProxy strin
+ 			CurrentVersion: plugin.Version,
+ 		}
+ 
++		// 删除流程中的插件跳过：不检查更新、不下载覆盖 ZIP、不触发重载，
++		// 避免与墓碑收敛竞争。
++		if m.isDeleting(plugin.EntryPath) {
++			result.Skipped++
++			result.Results = append(result.Results, item)
++			continue
++		}
++
+ 		if plugin.UpdateURL == "" {
+ 			result.Skipped++
+ 			result.Results = append(result.Results, item)
+@@ -167,9 +176,10 @@ func (m *Manager) RunUpdateAllWithOptions(ctx context.Context, githubProxy strin
+ type AutoUpdater struct {
+ 	manager *Manager
+ 	// pendingReload 记录"新版本已落盘、但当时插件正忙所以没重载"的插件 entryPath。
+-	// 只在 Run 的 goroutine 里读写（runOnce / retryPendingReloads 都由同一个 select 驱动），
+-	// 因此不需要加锁。
++	// 由 Run 的 goroutine（runOnce / retryPendingReloads）读写；插件删除流程
++	// 会从 HTTP 请求 goroutine 调 ForgetPending，因此用 pendingMu 保护。
+ 	pendingReload map[string]struct{}
++	pendingMu     sync.Mutex
+ }
+ 
+ // NewAutoUpdater 创建自动更新调度器。
+@@ -177,6 +187,17 @@ func NewAutoUpdater(m *Manager) *AutoUpdater {
+ 	return &AutoUpdater{manager: m, pendingReload: make(map[string]struct{})}
+ }
+ 
++// ForgetPending 清除该插件被推迟的重载待办。插件删除成功后调用，
++// 避免下一个重试周期对着已删除的记录刷错误日志。
++func (a *AutoUpdater) ForgetPending(entryPath string) {
++	if a == nil {
++		return
++	}
++	a.pendingMu.Lock()
++	delete(a.pendingReload, entryPath)
++	a.pendingMu.Unlock()
++}
++
+ // Run 阻塞运行自动更新循环，直到 ctx 取消。应在独立 goroutine 中调用。
+ func (a *AutoUpdater) Run(ctx context.Context) {
+ 	timer := time.NewTimer(autoUpdateInitialDelay)
+@@ -210,7 +231,15 @@ func (a *AutoUpdater) Run(ctx context.Context) {
+ // retryPendingReloads 重试因插件忙而推迟的热重载：仍然忙就继续等下一个周期。
+ func (a *AutoUpdater) retryPendingReloads(ctx context.Context) {
+ 	m := a.manager
++
++	a.pendingMu.Lock()
++	pending := make([]string, 0, len(a.pendingReload))
+ 	for entryPath := range a.pendingReload {
++		pending = append(pending, entryPath)
++	}
++	a.pendingMu.Unlock()
++
++	for _, entryPath := range pending {
+ 		if busy, reason := m.IsPluginBusy(entryPath); busy {
+ 			slog.Debug("deferred reload still pending, plugin busy", "entryPath", entryPath, "reason", reason)
+ 			continue
+@@ -222,8 +251,11 @@ func (a *AutoUpdater) retryPendingReloads(ctx context.Context) {
+ 			slog.Info("deferred reload after update completed", "entryPath", entryPath)
+ 		}
+ 		// 成功失败都出队：失败通常是插件本身的问题，每 10 分钟重试只会刷日志。
+-		// 交给 HealthChecker 的自愈与下一轮自动更新处理。
++		// 交给 HealthChecker 的自愈与下一轮自动更新处理。删除中的插件也在此
++		// 出队（DeletePlugin 的 ForgetPending 通常已先一步清掉）。
++		a.pendingMu.Lock()
+ 		delete(a.pendingReload, entryPath)
++		a.pendingMu.Unlock()
+ 	}
+ }
+ 
+@@ -252,9 +284,11 @@ func (a *AutoUpdater) runOnce(ctx context.Context) {
+ 		slog.Warn("auto-update run failed", "error", err)
+ 		return
+ 	}
++	a.pendingMu.Lock()
+ 	for _, entryPath := range result.PendingReload {
+ 		a.pendingReload[entryPath] = struct{}{}
+ 	}
++	a.pendingMu.Unlock()
+ 	slog.Info("auto-update completed",
+ 		"total", result.Total,
+ 		"updated", result.Updated,
+diff --git a/internal/jsplugin/health.go b/internal/jsplugin/health.go
+index c139ec8..259e658 100644
+--- a/internal/jsplugin/health.go
++++ b/internal/jsplugin/health.go
+@@ -182,6 +182,12 @@ func (hc *HealthChecker) runChecks(ctx context.Context) {
+ 		default:
+ 		}
+ 
++		// 删除流程中的服务整轮跳过：不探测、不空闲驱逐、不写 error 状态，
++		// 避免与停服/删库竞争（ListServices 是快照，删除可能在快照之后发生）。
++		if hc.manager.isDeleting(svc.Name()) {
++			continue
++		}
++
+ 		// 先检查空闲状态
+ 		if hc.checkIdle(svc) {
+ 			continue
+@@ -459,6 +465,11 @@ func (hc *HealthChecker) runWakeupChecks(ctx context.Context) {
+ 		default:
+ 		}
+ 
++		// 删除流程中不再唤醒（计划也已在 Forget 中清除，这是双保险）。
++		if hc.manager.isDeleting(entryPath) {
++			continue
++		}
++
+ 		// 已被其他路径加载（懒加载/手动 enable）则跳过
+ 		if _, ok := hc.manager.GetService(entryPath); ok {
+ 			continue
+@@ -493,6 +504,18 @@ func (hc *HealthChecker) ClearRecovery(entryPath string) {
+ 	hc.mu.Unlock()
+ }
+ 
++// Forget 清除该插件在健康检查器中的全部计划与计数：唤醒计划、自愈退避、
++// 连续失败与 Busy 计数。插件删除流程在停服后调用，确保删除期间不会有任何
++// 健康检查侧的后台动作重新进入该插件。
++func (hc *HealthChecker) Forget(entryPath string) {
++	hc.mu.Lock()
++	delete(hc.failures, entryPath)
++	delete(hc.busyHits, entryPath)
++	delete(hc.recoveries, entryPath)
++	delete(hc.wakeupSchedule, entryPath)
++	hc.mu.Unlock()
++}
++
+ // runRecoveryAttempts 扫描 DB 中 status=error 的插件，对到达退避窗口的尝试 LoadPlugin。
+ //
+ // 行为：
+@@ -512,6 +535,10 @@ func (hc *HealthChecker) runRecoveryAttempts(ctx context.Context) {
+ 		if plugin.Status != JSPluginStatusError {
+ 			continue
+ 		}
++		// 删除流程中不得自愈：墓碑收敛后记录会消失，重试加载只会与删包竞争。
++		if hc.manager.isDeleting(plugin.EntryPath) {
++			continue
++		}
+ 
+ 		hc.mu.Lock()
+ 		ra, exists := hc.recoveries[plugin.EntryPath]
+diff --git a/internal/jsplugin/hot_reload.go b/internal/jsplugin/hot_reload.go
+index 806c8ec..f825997 100644
+--- a/internal/jsplugin/hot_reload.go
++++ b/internal/jsplugin/hot_reload.go
+@@ -39,6 +39,11 @@ func (h *HotReloader) ReloadPlugin(ctx context.Context, pluginID int64) error {
+ 	entryPath := plugin.EntryPath
+ 	slog.Info("hot reload plugin started", "plugin", entryPath, "id", pluginID)
+ 
++	// 删除流程中的插件不得热更新（文件监控 mtime 抖动等）。
++	if h.manager.isDeleting(entryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
++	}
++
+ 	// 获取旧服务（如果存在）
+ 	oldService, hasOld := h.manager.GetService(entryPath)
+ 
+diff --git a/internal/jsplugin/manager.go b/internal/jsplugin/manager.go
+index 38f6325..fb2732c 100644
+--- a/internal/jsplugin/manager.go
++++ b/internal/jsplugin/manager.go
+@@ -68,6 +68,13 @@ type Manager struct {
+ 	loadGroup            singleflight.Group
+ 	publicPathPrefixes   []string // 无需 JWT 的路径前缀（通过 RefreshPublicPaths 从 DB 加载，运行时可刷新）
+ 	playEventSubscribers sync.Map // 已订阅播放事件的插件 entryPath 集合
++	// deleting 标记删除流程进行中的插件 entryPath。标记后新请求/懒加载/健康
++	// 恢复/热更新/自动更新一律不得再进入该插件，直到删除成功收敛或失败回滚。
++	// 详见 DeletePlugin。
++	deleting sync.Map
++	// 删除排空 / 注销等待预算，零值使用默认常量；测试可改短。
++	drainTimeout      time.Duration
++	unregisterTimeout time.Duration
+ 	// lyricProviders 记录声明了歌词提供能力的插件 entryPath 集合。
+ 	// 语义是"已知歌词提供者"而非"当前已加载"：插件被空闲驱逐(UnloadPlugin)时**不**从此集合移除，
+ 	// 否则驱逐后 SearchLyrics 遍历到空集合会直接短路，永远无法懒加载唤醒插件(#303)。
+@@ -81,9 +88,10 @@ type Manager struct {
+ 
+ // NewManager 创建 JS 插件管理器
+ func NewManager(repo Repository, pluginsDir, pluginsDataDir, basePath string, router chi.Router, db database.DB) *Manager {
++	packager := NewPackageManager(pluginsDir, pluginsDataDir, repo)
+ 	m := &Manager{
+ 		repo:           repo,
+-		packager:       NewPackageManager(pluginsDir, pluginsDataDir, repo),
++		packager:       packager,
+ 		scheduler:      NewServiceScheduler(1),
+ 		jsManager:      jsruntime.NewJSEnvManager(),
+ 		pluginsDir:     pluginsDir,
+@@ -92,6 +100,13 @@ func NewManager(repo Repository, pluginsDir, pluginsDataDir, basePath string, ro
+ 		router:         router,
+ 		db:             db,
+ 	}
++	// 删除阶段 1（墓碑落盘前的排空窗口）内，上传/更新/商店安装不得覆盖 ZIP。
++	packager.SetInstallGuard(func(entryPath string) error {
++		if m.isDeleting(entryPath) {
++			return fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
++		}
++		return nil
++	})
+ 	return m
+ }
+ 
+@@ -211,10 +226,21 @@ func (m *Manager) Start(ctx context.Context) error {
+ 	internalCtx, cancel := context.WithCancel(ctx)
+ 	m.cancelFunc = cancel
+ 
++	// 先收敛上次删除中残留的墓碑（进程在删除 ZIP/数据目录/DB 记录任一阶段
++	// 崩溃，或某步失败）。必须在目录扫描之前完成：残留 ZIP 一旦被 Sync 当成
++	// 新插件自动安装，就会出现「记录已删却复活」；残留 active 记录没了包也
++	// 要在这里删记录，而不是等孤儿清理用错误的 keep_data 语义处理。
++	if recovered, err := m.packager.RecoverPendingUninstalls(); err != nil {
++		slog.Error("recover pending js plugin uninstalls failed", "error", err)
++	} else if len(recovered) > 0 {
++		slog.Info("recovered pending js plugin uninstalls", "count", len(recovered))
++	}
++
+ 	// 从本地 zip 文件同步插件记录：
+ 	//   - 新发现 zip → InstallFromUpload（强制 manifest hash 校验）
+ 	//   - 已有记录但 zipHash 不一致 → Update（重新计算规范化 hash）
+ 	//   - 数据库有但 zip 文件不在 → 删除孤儿记录
++	//   - 带未收敛墓碑的 entryPath → 跳过，交给下一轮恢复
+ 	// SyncPluginsFromDirectory 返回完整的插件列表，直接复用，
+ 	// 避免再次调用 repo.GetAll() 引发与 WASM 插件管理器的 SQLITE_BUSY 锁竞争。
+ 	synced, err := m.packager.SyncPluginsFromDirectory()
+@@ -295,9 +321,20 @@ func (m *Manager) loadPlugins(ctx context.Context, plugins []*JSPlugin) {
+ // LoadPlugin 的 follower 则会拿到 ErrPluginDisabled 之类而误判失败。
+ // 见 load_race_test.go。
+ func (m *Manager) LoadPlugin(ctx context.Context, plugin *JSPlugin) error {
++	// 删除流程中禁止任何形式的加载（懒加载、健康自愈唤醒、热更新/自动更新
++	// 重载），否则刚排空停服的插件可能在删包前被重新拉起。
++	if m.isDeleting(plugin.EntryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
++	}
++
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 
++	// 持锁后再查一次：删除流程可能在上面的无锁检查之后拿到 m.mu 先行。
++	if m.isDeleting(plugin.EntryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
++	}
++
+ 	// 幂等：已加载就直接成功返回。JS 环境的 envID 全局唯一，重复创建必然失败，
+ 	// 而"已经加载好了"本身不是错误——热更新/Enable 等需要真正重载的路径都会先 UnloadPlugin。
+ 	if _, ok := m.services.Load(plugin.EntryPath); ok {
+@@ -416,6 +453,11 @@ func (m *Manager) UnloadPlugin(ctx context.Context, entryPath string) error {
+ 
+ // ReloadPlugin 重载插件（unload + 清除字节码缓存 + load）
+ func (m *Manager) ReloadPlugin(ctx context.Context, entryPath string) error {
++	// 删除中的插件不得被热更新/自动更新/上传更新重新拉起。
++	if m.isDeleting(entryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
++	}
++
+ 	// 先获取插件信息
+ 	plugin, err := m.repo.GetByEntryPath(ctx, entryPath)
+ 	if err != nil {
+@@ -444,6 +486,10 @@ func (m *Manager) EnablePlugin(ctx context.Context, id int64) error {
+ 		return fmt.Errorf("get plugin by id %d: %w", id, err)
+ 	}
+ 
++	if m.isDeleting(plugin.EntryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
++	}
++
+ 	// 先卸载可能残留的旧环境（如从 error 状态重新启用时）
+ 	_ = m.UnloadPlugin(ctx, plugin.EntryPath)
+ 
+@@ -476,6 +522,10 @@ func (m *Manager) DisablePlugin(ctx context.Context, id int64) error {
+ 		return fmt.Errorf("get plugin by id %d: %w", id, err)
+ 	}
+ 
++	if m.isDeleting(plugin.EntryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginDeleting, plugin.EntryPath)
++	}
++
+ 	// 卸载插件
+ 	_ = m.UnloadPlugin(ctx, plugin.EntryPath)
+ 
+@@ -532,6 +582,12 @@ func (m *Manager) IsPluginBusy(entryPath string) (bool, string) {
+ // 并发去重：用 singleflight 按 entryPath 合并同时进入的多次 LoadPlugin，
+ // 防止 50 个请求并发触发空闲驱逐插件时同时跑 50 次 hash 校验/scheduler 注册。
+ func (m *Manager) EnsureLoaded(ctx context.Context, entryPath string) (*JSService, error) {
++	// 删除一旦开始，所有公开路由立即不可达：直接按「不存在」拒绝（404），
++	// 不进入懒加载，也不返回缓存的旧 service（排空期间它可能还在 map 中）。
++	if m.isDeleting(entryPath) {
++		return nil, ErrPluginNotFound
++	}
++
+ 	// 快速路径：已加载直接返回。
+ 	if svc, ok := m.GetService(entryPath); ok {
+ 		return svc, nil
+@@ -544,9 +600,16 @@ func (m *Manager) EnsureLoaded(ctx context.Context, entryPath string) (*JSServic
+ 			return svc, nil
+ 		}
+ 
++		// 排队 singleflight 期间删除开始：按不存在拒绝，不做懒加载。
++		if m.isDeleting(entryPath) {
++			return nil, ErrPluginNotFound
++		}
++
+ 		plugin, err := m.repo.GetByEntryPath(ctx, entryPath)
+ 		if err != nil {
+-			if errors.Is(err, sql.ErrNoRows) {
++			// 仓储层把未命中归一为 database.ErrNotFound；部分直连路径仍可能给
++			// sql.ErrNoRows，两者都按「插件不存在」处理（路由映射 404）。
++			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, database.ErrNotFound) {
+ 				return nil, ErrPluginNotFound
+ 			}
+ 			return nil, fmt.Errorf("get plugin by entry_path %q: %w", entryPath, err)
+diff --git a/internal/jsplugin/package.go b/internal/jsplugin/package.go
+index 0768d06..679b960 100644
+--- a/internal/jsplugin/package.go
++++ b/internal/jsplugin/package.go
+@@ -10,6 +10,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -37,6 +38,31 @@ type PackageManager struct {
+ 	pluginsDir string // data/jsplugins/ 存放 zip 的目录
+ 	dataDir    string // 插件数据目录（static 解压位置）
+ 	repo       Repository
++	// uninstallMu 串行化墓碑落盘与收敛删除，避免同 entryPath 的并发卸载
++	// （DELETE 重试 / 启动恢复）交错执行。
++	uninstallMu sync.Mutex
++	// installGuard 在写盘前对 entryPath 做同进程内存校验。Manager 注入它来
++	// 拦截删除阶段 1（墓碑尚未落盘的排空窗口）内的上传/更新/商店安装；
++	// 墓碑本身负责持久层（重启后）防护。nil 时跳过。
++	installGuard func(entryPath string) error
++}
++
++// SetInstallGuard 注入写盘前 entryPath 校验钩子（Manager 在构造时调用）。
++func (pm *PackageManager) SetInstallGuard(guard func(entryPath string) error) {
++	pm.installGuard = guard
++}
++
++// checkInstallGuard 统一执行内存 + 墓碑两层安装防护。
++func (pm *PackageManager) checkInstallGuard(entryPath string) error {
++	if pm.installGuard != nil {
++		if err := pm.installGuard(entryPath); err != nil {
++			return err
++		}
++	}
++	if pm.hasUninstallState(entryPath) {
++		return fmt.Errorf("%w: %s", ErrPluginUninstalling, entryPath)
++	}
++	return nil
+ }
+ 
+ // NewPackageManager 构造函数
+@@ -96,6 +122,12 @@ func (pm *PackageManager) InstallFromUploadWithOptions(zipData []byte, opts Inst
+ 		return nil, false, fmt.Errorf("validate manifest: %w", err)
+ 	}
+ 
++	// [2.1] 删除流程中（内存标记）或删除未收敛（墓碑仍在）时拒绝安装：
++	// 否则新 ZIP 可能在排空窗口覆盖旧包、或立刻被收敛流程删掉。
++	if err := pm.checkInstallGuard(manifest.EntryPath); err != nil {
++		return nil, false, err
++	}
++
+ 	// [3] 验证权限
+ 	if err := ValidatePermissions(manifest.Permissions); err != nil {
+ 		return nil, false, fmt.Errorf("validate permissions: %w", err)
+@@ -249,6 +281,11 @@ func (pm *PackageManager) Update(pluginID int64, zipData []byte) (*JSPlugin, err
+ 		return nil, fmt.Errorf("entryPath mismatch: existing=%q, new=%q", existing.EntryPath, manifest.EntryPath)
+ 	}
+ 
++	// [5.1] 删除流程中（内存标记）或墓碑未收敛时拒绝覆盖更新。
++	if err := pm.checkInstallGuard(manifest.EntryPath); err != nil {
++		return nil, err
++	}
++
+ 	// [6] 读取入口文件并计算 hash（规范化 zip_hash 排除 plugin.json）。
+ 	entryContent, _, err := readEntryFromZip(zipData, manifest.Main)
+ 	if err != nil {
+@@ -317,9 +354,23 @@ func (pm *PackageManager) Update(pluginID int64, zipData []byte) (*JSPlugin, err
+ 	return existing, nil
+ }
+ 
+-// Uninstall 卸载插件（删除 ZIP + 数据库记录，可选保留数据目录）
+-// keepData=true 时仅删除 ZIP 和 DB 记录，保留插件数据目录
++// Uninstall 卸载插件（删除 ZIP + 数据库记录，可选保留数据目录）。
++//
++// 墓碑驱动的可恢复删除：先原子落盘删除意图（见 pluginUninstallState），再依次
++// 删除 ZIP、数据目录（keepData=true 保留）、DB 记录，全部成功后才删墓碑。
++// 任一步失败或进程中途崩溃，墓碑保留在磁盘，下次启动由
++// RecoverPendingUninstalls 继续收敛，不会留下「有记录没包」或「残留 ZIP 被
++// 重新扫描安装」的半卸载状态。
++//
++// 调用方（Manager.DeletePlugin）必须在调用前完成运行态阻断、排空与停服；
++// 本方法只负责持久状态与文件系统收敛。
++//
++// keepData=true 时保留插件数据目录（文件系统存储）；宿主 DB 中的
++// plugin_storage 始终沿用既有「卸载后保留」语义，不在此删除。
+ func (pm *PackageManager) Uninstall(pluginID int64, keepData bool) error {
++	pm.uninstallMu.Lock()
++	defer pm.uninstallMu.Unlock()
++
+ 	ctx := context.Background()
+ 
+ 	// [1] 获取插件信息
+@@ -328,23 +379,15 @@ func (pm *PackageManager) Uninstall(pluginID int64, keepData bool) error {
+ 		return fmt.Errorf("get plugin by id %d: %w", pluginID, err)
+ 	}
+ 
+-	// [2] 删除 ZIP 文件
+-	zipFilePath := filepath.Join(pm.pluginsDir, plugin.FilePath)
+-	if err := os.Remove(zipFilePath); err != nil && !os.IsNotExist(err) {
+-		slog.Warn("remove zip file failed", "path", zipFilePath, "error", err)
+-	}
+-
+-	// [3] 删除数据目录（keepData=true 时跳过）
+-	if !keepData {
+-		staticDir := filepath.Join(pm.dataDir, plugin.EntryPath)
+-		if err := os.RemoveAll(staticDir); err != nil {
+-			slog.Warn("remove data dir failed", "path", staticDir, "error", err)
+-		}
++	// [2] 破坏性操作前先持久化删除意图（已存在墓碑时幂等沿用）
++	state, err := pm.beginUninstall(plugin.EntryPath, plugin.FilePath, keepData)
++	if err != nil {
++		return fmt.Errorf("persist uninstall state: %w", err)
+ 	}
+ 
+-	// [4] 删除数据库记录
+-	if err := pm.repo.Delete(ctx, pluginID); err != nil {
+-		return fmt.Errorf("delete plugin record: %w", err)
++	// [3] 按墓碑幂等收敛：ZIP → 数据目录 → DB 记录 → 墓碑
++	if err := pm.finishUninstall(ctx, state); err != nil {
++		return err
+ 	}
+ 
+ 	slog.Info("plugin uninstalled", "entryPath", plugin.EntryPath, "keepData", keepData)
+@@ -379,6 +422,10 @@ func (pm *PackageManager) SyncPluginsFromDirectory() ([]*JSPlugin, error) {
+ 		dbMap[p.EntryPath] = p
+ 	}
+ 
++	// 未收敛的删除墓碑（正常流程下 RecoverPendingUninstalls 已在扫描前清掉；
++	// 这里是防御：收敛失败被保留的 ZIP 绝不能被当新插件重新安装）。
++	tombstones := pm.uninstallStateEntries()
++
+ 	var result []*JSPlugin
+ 
+ 	for _, entry := range entries {
+@@ -391,6 +438,16 @@ func (pm *PackageManager) SyncPluginsFromDirectory() ([]*JSPlugin, error) {
+ 		}
+ 
+ 		entryPath := EntryPathFromZipName(name)
++
++		// 该 ZIP 属于一个尚未收敛的删除：保持删除意图，等下次恢复收敛，
++		// 不重新安装、不按 hash 更新。
++		if tombstones[entryPath] {
++			slog.Warn("skip zip with pending uninstall tombstone",
++				"file", name, "entryPath", entryPath)
++			delete(dbMap, entryPath) // 对应记录也交给收敛流程，不走下面的孤儿清理
++			continue
++		}
++
+ 		zipFilePath := filepath.Join(pm.pluginsDir, name)
+ 
+ 		if existing, ok := dbMap[entryPath]; ok {
+diff --git a/internal/jsplugin/routes.go b/internal/jsplugin/routes.go
+index f4ab02b..b0b2a07 100644
+--- a/internal/jsplugin/routes.go
++++ b/internal/jsplugin/routes.go
+@@ -250,6 +250,11 @@ func (m *Manager) RegisterAPIRoutes(r chi.Router) {
+ // @Router /jsplugin/{entryPath} [get]
+ func (m *Manager) handlePluginStatic(w http.ResponseWriter, r *http.Request) {
+ 	entryPath := chi.URLParam(r, "entryPath")
++	// 删除开始后公开页面立即不可达，不等磁盘目录被删掉。
++	if m.isDeleting(entryPath) {
++		http.Error(w, "plugin not found", http.StatusNotFound)
++		return
++	}
+ 	staticRoot := filepath.Join(m.pluginsDataDir, entryPath, "static")
+ 	absStaticRoot, err := filepath.Abs(staticRoot)
+ 	if err != nil {
+@@ -327,6 +332,12 @@ func (m *Manager) handlePluginAPIRequest(w http.ResponseWriter, r *http.Request)
+ 	entryPath := chi.URLParam(r, "entryPath")
+ 	subPath := chi.URLParam(r, "*")
+ 
++	// 删除开始后该插件的所有公开路径（含静态兜底页）立即 404。
++	if m.isDeleting(entryPath) {
++		m.writePluginUnavailable(w, r, entryPath, ErrPluginNotFound)
++		return
++	}
++
+ 	// 根路径（带尾部斜杠）：直接返回 static/index.html（不依赖 JS 运行时）
+ 	if subPath == "" {
+ 		staticRoot := filepath.Join(m.pluginsDataDir, entryPath, "static")
+@@ -424,6 +435,13 @@ func (m *Manager) writePluginUnavailable(w http.ResponseWriter, r *http.Request,
+ //	GET /api/v1/jsplugin/{entryPath}/static              → static/index.html
+ //	GET /api/v1/jsplugin/{entryPath}/static/some/route   → 未命中 → fallback 到 index.html
+ func (m *Manager) servePluginStaticFile(w http.ResponseWriter, r *http.Request, entryPath, subPath string) {
++	// 删除开始后静态资源立即 404（handlePluginAPIRequest 的 static 兜底分支
++	// 已在入口拦截，这里覆盖 /static 与 /static/* 两条独立注册的路由）。
++	if m.isDeleting(entryPath) {
++		http.NotFound(w, r)
++		return
++	}
++
+ 	// 磁盘根目录：jsplugins_data/<entryPath>/static/
+ 	staticRoot := filepath.Join(m.pluginsDataDir, entryPath, "static")
+ 	absStaticRoot, err := filepath.Abs(staticRoot)
+@@ -761,6 +779,12 @@ func (m *Manager) handlePluginFileServe(w http.ResponseWriter, r *http.Request)
+ 	entryPath := chi.URLParam(r, "entryPath")
+ 	filePath := chi.URLParam(r, "*")
+ 
++	// 删除中的插件不再放行文件直取（music://、相对数据目录等）。
++	if m.isDeleting(entryPath) {
++		http.NotFound(w, r)
++		return
++	}
++
+ 	if filePath == "" {
+ 		http.NotFound(w, r)
+ 		return
+@@ -996,6 +1020,12 @@ func (m *Manager) RefreshPublicPaths() {
+ 
+ // IsPublicPath 检查请求路径是否匹配某个插件的 publicPaths（供 AuthMiddleware 跳过认证）。
+ func (m *Manager) IsPublicPath(path string) bool {
++	// 删除一旦开始，该插件的 publicPaths 立即失效（DB 记录删除 + RefreshPublicPaths
++	// 之间的窗口由这里兜住），避免免鉴权路径在排空期间仍放行新请求。
++	if m.isDeletingPluginPath(path) {
++		return false
++	}
++
+ 	m.mu.RLock()
+ 	prefixes := m.publicPathPrefixes
+ 	m.mu.RUnlock()
+@@ -1007,3 +1037,21 @@ func (m *Manager) IsPublicPath(path string) bool {
+ 	}
+ 	return false
+ }
++
++// isDeletingPluginPath 判断请求路径是否归属一个删除中的插件
++// （/api/v1/jsplugin/{entryPath} 及其任意子路径，含静态资源）。
++func (m *Manager) isDeletingPluginPath(path string) bool {
++	const prefix = "/api/v1/jsplugin/"
++	if !strings.HasPrefix(path, prefix) {
++		return false
++	}
++	rest := path[len(prefix):]
++	entryPath, _, ok := strings.Cut(rest, "/")
++	if !ok {
++		entryPath = rest // 无尾斜杠的插件根路径
++	}
++	if entryPath == "" {
++		return false
++	}
++	return m.isDeleting(entryPath)
++}
+diff --git a/internal/jsplugin/scheduler.go b/internal/jsplugin/scheduler.go
+index 185a060..3aeaa57 100644
+--- a/internal/jsplugin/scheduler.go
++++ b/internal/jsplugin/scheduler.go
+@@ -44,8 +44,13 @@ var (
+ 	ErrQueueFull           = errors.New("scheduler: message queue full (backpressure)")
+ 	ErrCallTimeout         = errors.New("scheduler: call timeout")
+ 	ErrServiceUnregistered = errors.New("scheduler: service unregistered during call")
++	// ErrDrainTimeout 表示在限定时间内未能排空插件队列中已排队/处理中的消息。
++	// 插件卸载用它作为「仍在运行、不得继续破坏性删除」的可观察信号。
++	ErrDrainTimeout = errors.New("scheduler: drain timed out, service still processing")
+ )
+ 
++const defaultDrainTimeout = 10 * time.Second
++
+ // Message 统一消息格式（借鉴 Skynet 的 session + type 机制）
+ type Message struct {
+ 	ID       uint64          // 全局递增消息 ID
+@@ -71,6 +76,97 @@ type serviceEntry struct {
+ 	cancel   context.CancelFunc
+ 	done     chan struct{} // worker 退出信号
+ 	closed   atomic.Bool   // 标记是否已关闭入口
++	// sendMu 串行化「closed 检查 → 入队」与「关闭队列」，杜绝向已关闭 channel
++	// 发送导致的 panic（dispatch 不持注册表锁，Unregister 可能并发发生）。
++	sendMu sync.Mutex
++	// inflight 跟踪所有「已入队但尚未处理完」的消息。DrainService 靠它等待
++	// 队列排空与运行中的调用结束。刻意不用 sync.WaitGroup：排空超时后服务要
++	// unfreeze 恢复接客，WaitGroup 不允许零计数后再 Add 与旧 Wait 并发。
++	inflight inflightTracker
++}
++
++// inflightTracker 是带「归零通知」的在途消息计数器，支持超时等待后被放弃、
++// 之后继续计数（不像 sync.WaitGroup 那样有 Wait/Add 复用约束）。
++type inflightTracker struct {
++	mu     sync.Mutex
++	n      int64
++	zeroCh chan struct{} // 非 nil 表示有等待者；n 归零时关闭它
++}
++
++// add 调整在途计数；归零时通知当前等待者（若有）。
++func (t *inflightTracker) add(delta int64) {
++	t.mu.Lock()
++	t.n += delta
++	if t.n == 0 && t.zeroCh != nil {
++		close(t.zeroCh)
++		t.zeroCh = nil
++	}
++	t.mu.Unlock()
++}
++
++// zeroChannel 返回一个在计数归零时关闭的 channel；计数已为 0 时返回已关闭 channel。
++func (t *inflightTracker) zeroChannel() chan struct{} {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.n == 0 {
++		return closedChan
++	}
++	if t.zeroCh == nil {
++		t.zeroCh = make(chan struct{})
++	}
++	return t.zeroCh
++}
++
++// closedChan 是进程级共享的已关闭 channel。
++var closedChan = func() chan struct{} {
++	ch := make(chan struct{})
++	close(ch)
++	return ch
++}()
++
++// freeze 拒绝新消息入队，但保留注册与 worker：排空超时可以 unfreeze 恢复服务，
++// 成功则由后续 shutdown/Unregister 关队列。
++func (e *serviceEntry) freeze() {
++	e.sendMu.Lock()
++	e.closed.Store(true)
++	e.sendMu.Unlock()
++}
++
++// unfreeze 恢复接收新消息（排空超时回滚用）。
++func (e *serviceEntry) unfreeze() {
++	e.sendMu.Lock()
++	e.closed.Store(false)
++	e.sendMu.Unlock()
++}
++
++// shutdown 拒绝新消息并关闭队列。必须与 tryEnqueue 在同一把 sendMu 下配对，
++// 否则 dispatch 可能在 closed 检查之后撞上 close。
++func (e *serviceEntry) shutdown() {
++	e.sendMu.Lock()
++	e.closed.Store(true)
++	close(e.msgQueue)
++	e.sendMu.Unlock()
++}
++
++// tryEnqueue 在入口开放时把消息放入队列并计入 inflight。
++// 入口关闭返回 ErrServiceUnregistered，队列满返回 ErrQueueFull。
++func (e *serviceEntry) tryEnqueue(msg *Message) error {
++	e.sendMu.Lock()
++	defer e.sendMu.Unlock()
++
++	if e.closed.Load() {
++		return fmt.Errorf("%w: %q", ErrServiceUnregistered, e.name)
++	}
++
++	// 先计数再入队：若先入队后计数，DrainService 可能在消息刚排队时误判已排空。
++	e.inflight.add(1)
++	select {
++	case e.msgQueue <- msg:
++		return nil
++	default:
++		e.inflight.add(-1)
++		return fmt.Errorf("%w: target=%q, queue capacity=%d", ErrQueueFull, e.name, cap(e.msgQueue))
++	}
+ }
+ 
+ // ServiceScheduler 借鉴 Skynet 的消息分发机制
+@@ -134,7 +230,12 @@ func (s *ServiceScheduler) runWorker(ctx context.Context, entry *serviceEntry) {
+ 		select {
+ 		case msg, ok := <-entry.msgQueue:
+ 			if !ok {
+-				// channel 已关闭，排空处理
++				// 关队列时仍排队的消息不会再被任何消费者处理（同步调用方会拿到
++				// ErrCallTimeout/ErrServiceUnregistered），按剩余长度一次性结清
++				// inflight，避免计数泄漏导致 DrainService 永远等不到归零。
++				if n := len(entry.msgQueue); n > 0 {
++					entry.inflight.add(-int64(n))
++				}
+ 				return
+ 			}
+ 			s.processMessage(entry, msg)
+@@ -148,6 +249,10 @@ func (s *ServiceScheduler) runWorker(ctx context.Context, entry *serviceEntry) {
+ 
+ // processMessage 处理单条消息
+ func (s *ServiceScheduler) processMessage(entry *serviceEntry, msg *Message) {
++	// 与 tryEnqueue 的计数配对：无论跳过、处理成功还是 handler panic（recover
++	// 由上层保证），退出都要减一。
++	defer entry.inflight.add(-1)
++
+ 	// 客户端在排队期间已经放弃（如用户快速切歌触发 abort）的请求，直接跳过，
+ 	// 避免 worker 被串行化的 ExecuteJS 卡住，新切的歌排在它后面一直 pending。
+ 	// 已取消的消息往往 RespChan 也无人接收（Call 已 return），无需回填 resp。
+@@ -188,7 +293,39 @@ func (s *ServiceScheduler) drainQueue(entry *serviceEntry) {
+ 	}
+ }
+ 
+-// UnregisterService 注销服务（等待队列消息处理完毕或超时）
++// DrainService 先冻结服务（拒绝新消息入队），再等待所有已排队/处理中的消息排空。
++//
++// 与 UnregisterService 的区别：不摘注册表、不关队列——排空超时时可以 unfreeze
++// 让服务恢复正常接客，调用方据此中止卸载（不允许在插件仍在执行时删包删库）。
++// 排空成功后调用方应紧接着 UnregisterService，期间新消息仍被拒绝。
++//
++// timeout<=0 使用 defaultDrainTimeout。
++func (s *ServiceScheduler) DrainService(name string, timeout time.Duration) error {
++	s.mu.RLock()
++	entry, exists := s.services[name]
++	s.mu.RUnlock()
++	if !exists {
++		return ErrServiceNotFound
++	}
++
++	entry.freeze()
++
++	if timeout <= 0 {
++		timeout = defaultDrainTimeout
++	}
++	select {
++	case <-entry.inflight.zeroChannel():
++		return nil
++	case <-time.After(timeout):
++		// 仍有调用在运行：放开入口，插件继续正常服务，本次卸载中止。
++		// 放弃的等待者不影响计数器（zeroCh 归零时自然关闭，无人接收即可）。
++		entry.unfreeze()
++		return fmt.Errorf("%w: %q", ErrDrainTimeout, name)
++	}
++}
++
++// UnregisterService 注销服务（关队列并等待 worker 退出，超时则强制取消）。
++// 优雅卸载应先 DrainService 排空，成功后再调本方法。
+ func (s *ServiceScheduler) UnregisterService(name string, timeout time.Duration) error {
+ 	s.mu.Lock()
+ 	entry, exists := s.services[name]
+@@ -196,14 +333,12 @@ func (s *ServiceScheduler) UnregisterService(name string, timeout time.Duration)
+ 		s.mu.Unlock()
+ 		return ErrServiceNotFound
+ 	}
+-	// 标记为已关闭，不再接受新消息
+-	entry.closed.Store(true)
+ 	// 从注册表移除
+ 	delete(s.services, name)
+ 	s.mu.Unlock()
+ 
+-	// 关闭消息队列入口，worker 会处理完剩余消息
+-	close(entry.msgQueue)
++	// 拒绝新消息并关闭队列（sendMu 保护，杜绝并发 send on closed channel）
++	entry.shutdown()
+ 
+ 	// 等待 worker 完成或超时
+ 	if timeout <= 0 {
+@@ -215,6 +350,7 @@ func (s *ServiceScheduler) UnregisterService(name string, timeout time.Duration)
+ 	case <-time.After(timeout):
+ 		entry.cancel()
+ 		<-entry.done
++
+ 		return fmt.Errorf("scheduler: unregister %q timed out, worker force stopped", name)
+ 	}
+ }
+@@ -278,16 +414,7 @@ func (s *ServiceScheduler) dispatch(msg *Message) error {
+ 		return fmt.Errorf("%w: %q", ErrServiceNotFound, msg.Target)
+ 	}
+ 
+-	if entry.closed.Load() {
+-		return fmt.Errorf("%w: %q", ErrServiceUnregistered, msg.Target)
+-	}
+-
+-	select {
+-	case entry.msgQueue <- msg:
+-		return nil
+-	default:
+-		return fmt.Errorf("%w: target=%q, queue capacity=%d", ErrQueueFull, msg.Target, cap(entry.msgQueue))
+-	}
++	return entry.tryEnqueue(msg)
+ }
+ 
+ // HasService 检查服务是否存在
+@@ -327,8 +454,7 @@ func (s *ServiceScheduler) Close() error {
+ 
+ 	// 关闭所有服务
+ 	for _, entry := range entries {
+-		entry.closed.Store(true)
+-		close(entry.msgQueue)
++		entry.shutdown()
+ 	}
+ 
+ 	// 等待所有 worker 退出
+diff --git a/internal/jsplugin/service.go b/internal/jsplugin/service.go
+index 2474eca..d57d3a6 100644
+--- a/internal/jsplugin/service.go
++++ b/internal/jsplugin/service.go
+@@ -416,7 +416,12 @@ func (s *JSService) Deinit() error {
+ 	return nil
+ }
+ 
+-// Stop 停止服务（Deinit + 销毁 JS 环境）
++// Stop 停止服务（停定时器 → Deinit → 桥接资源清理 → 销毁 JS 环境）。
++//
++// 每一步都会执行，不因前一步出错而跳过，避免后台进程/socket/VM 泄漏。
++// 错误语义：onDeinit 抛错与桥接资源关闭错误只记日志（插件回调失败不代表
++// 仍在运行，资源关闭均为幂等 best-effort）；唯独脚本环境销毁失败向上返回——
++// 删除流程据此中止破坏性操作，不能在 VM 可能仍存活时删包删库。
+ func (s *JSService) Stop() error {
+ 	s.mu.Lock()
+ 	if s.status == ServiceStatusStopped {
+@@ -431,16 +436,19 @@ func (s *JSService) Stop() error {
+ 	// 调用 deinit（忽略错误，确保后续清理继续）
+ 	_ = s.Deinit()
+ 
+-	// 清理桥接处理器资源（终止后台进程等）
++	// 清理桥接处理器资源（终止后台进程、关闭 UDP/TCP socket、HTTP 流、
++	// 入站 WebSocket；内部等待各 readLoop 退出）
+ 	if s.bridgeHandler != nil {
+ 		s.bridgeHandler.Cleanup()
+ 	}
+ 
+ 	// 销毁 JS 环境（包含本插件创建的所有子 env，例如 songloft.jsenv.create 的）
+ 	// DestroyPluginEnvs 按 pluginID 批量回收，root env 也在其中。
++	var stopErr error
+ 	if s.plugin != nil {
+ 		if err := s.jsManager.DestroyPluginEnvs(s.plugin.ID); err != nil {
+ 			slog.Warn("destroy plugin envs failed", "plugin", s.plugin.EntryPath, "error", err)
++			stopErr = fmt.Errorf("destroy plugin envs: %w", err)
+ 		}
+ 	}
+ 
+@@ -449,7 +457,7 @@ func (s *JSService) Stop() error {
+ 	s.mu.Unlock()
+ 
+ 	slog.Info("JS plugin stopped", "plugin", s.plugin.EntryPath)
+-	return nil
++	return stopErr
+ }
+ 
+ // armTimerStop 取得（必要时创建）定时器 goroutine 的停止信号。
+diff --git a/internal/jsplugin/uninstall.go b/internal/jsplugin/uninstall.go
+new file mode 100644
+index 0000000..4376494
+--- /dev/null
++++ b/internal/jsplugin/uninstall.go
+@@ -0,0 +1,174 @@
++package jsplugin
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log/slog"
++	"time"
++)
++
++// 删除运行态阶段的超时预算。
++const (
++	// pluginDrainTimeout 等待插件已排队/处理中的 HTTP 请求、设备事件等消息
++	// 排空的上限。插件最慢的合法调用可达 300s，但删除是管理员显式动作，过长的
++	// 在途调用宁可让本次删除失败可重试，也不能把 HTTP 请求挂死——超时后服务
++	// 恢复接客，调用方收到明确错误。
++	pluginDrainTimeout = 10 * time.Second
++	// pluginUnregisterTimeout 排空成功后等待调度 worker 退出的上限。
++	// 排空已确认队列归零，正常情况下立即完成。
++	pluginUnregisterTimeout = 5 * time.Second
++)
++
++// ErrPluginDeleting 插件删除流程正在进行：新的请求、懒加载、健康恢复、
++// 热更新与自动更新都不得再进入该插件。
++var ErrPluginDeleting = errors.New("jsplugin: plugin is being deleted")
++
++// IsPluginUninstallingError 判断错误是否为「删除中」或「删除未收敛」。
++func IsPluginUninstallingError(err error) bool {
++	return errors.Is(err, ErrPluginDeleting) || errors.Is(err, ErrPluginUninstalling)
++}
++
++// DeletePlugin 删除一个 JS 插件，两阶段执行：
++//
++//	阶段 1（运行态收敛，全部失败都中止且不动磁盘/DB）：
++//	  a. 标记 deleting —— 立即阻断新的 HTTP 请求、懒加载、健康恢复/唤醒、
++//	     热更新与自动更新；
++//	  b. DrainService 排空已排队与运行中的调用（超时则回滚放开、返回错误，
++//	     插件继续服务）；
++//	  c. 注销调度器、停止服务（定时器、onDeinit、后台进程、UDP/TCP/WebSocket、
++//	     脚本环境）；任一失败返回可观察错误，绝不进入破坏性阶段；
++//	  d. 撤销播放订阅、歌词/封面提供者、健康检查计划。
++//	阶段 2（持久收敛，见 PackageManager.Uninstall）：
++//	  先落盘删除墓碑，再删 ZIP → 数据目录（keep_data=true 保留）→ DB 记录 →
++//	  墓碑。部分失败或进程崩溃由下次启动的 RecoverPendingUninstalls 继续收敛。
++//
++// 成功后 publicPaths 立即刷新；同一 entryPath 可正常重新安装。
++// 返回被删插件元数据，供调用方清理宿主侧关联配置（tab/排序等）。
++func (m *Manager) DeletePlugin(ctx context.Context, pluginID int64, keepData bool) (*JSPlugin, error) {
++	plugin, err := m.repo.GetByID(ctx, pluginID)
++	if err != nil {
++		return nil, fmt.Errorf("get plugin by id %d: %w", pluginID, err)
++	}
++	entryPath := plugin.EntryPath
++
++	// a. 阻断新入口。LoadOrStore 保证同一 entryPath 同时只有一个删除流程。
++	if _, exists := m.deleting.LoadOrStore(entryPath, struct{}{}); exists {
++		return nil, fmt.Errorf("%w: %s", ErrPluginDeleting, entryPath)
++	}
++	// 无论阶段 2 成败都放开内存阻断：阶段 2 失败时记录仍在、墓碑保证删除意图
++	// 不丢（安装/更新/扫描被墓碑拦截），管理员可用同一 ID 重试 DELETE；
++	// 记录已删时插件本身已不存在，标记留着只会挡住同 entryPath 的重新安装。
++	defer m.deleting.Delete(entryPath)
++
++	// b+c. 排空 + 注销 + 停服。失败即中止，包与 DB 记录原样保留。
++	if err := m.quiesceForDelete(plugin); err != nil {
++		return nil, err
++	}
++
++	// d. 撤销宿主侧运行态注册。
++	m.playEventSubscribers.Delete(entryPath)
++	m.lyricProviders.Delete(entryPath)
++	m.coverProviders.Delete(entryPath)
++	if m.healthChecker != nil {
++		m.healthChecker.Forget(entryPath)
++	}
++	// 清掉自动更新里「已落盘但推迟重载」的待办，避免重试周期复活插件。
++	if m.autoUpdater != nil {
++		m.autoUpdater.ForgetPending(entryPath)
++	}
++
++	slog.Info("js plugin runtime quiesced for delete",
++		"entryPath", entryPath, "keepData", keepData)
++
++	// 阶段 2：墓碑 + ZIP/数据目录/DB 记录的幂等收敛。
++	if err := m.packager.Uninstall(pluginID, keepData); err != nil {
++		return nil, fmt.Errorf("uninstall plugin %q: %w", entryPath, err)
++	}
++
++	// DB 记录已删除，重建 publicPaths 缓存，公开路由立即失效。
++	m.RefreshPublicPaths()
++
++	slog.Info("js plugin deleted", "entryPath", entryPath, "keepData", keepData)
++	return plugin, nil
++}
++
++// quiesceForDelete 在 m.mu 保护下完成删除的运行态收敛：
++// 冻结入口 → 排空在途消息 → 注销调度器 → 停服 → 移出 services map。
++//
++// 任何步骤失败都返回错误，调用方据此中止破坏性删除；此时插件不会处于
++// 「调度器已摘但 VM 还在跑」的半卸载状态——排空超时会恢复接客，注销/停服
++// 失败则把已停的 service 移出 map，下次请求经懒加载完整重建。
++func (m *Manager) quiesceForDelete(plugin *JSPlugin) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	entryPath := plugin.EntryPath
++
++	value, ok := m.services.Load(entryPath)
++	if !ok {
++		// 插件未加载（空闲驱逐/error/inactive）：回收可能残留的孤儿 JS 环境。
++		// 它们已无调度器入口、不可能执行消息，销毁失败仅告警，不阻断删除。
++		if err := m.jsManager.DestroyPluginEnvs(plugin.ID); err != nil {
++			slog.Warn("cleanup stale plugin envs during delete failed",
++				"entryPath", entryPath, "error", err)
++		}
++		return nil
++	}
++	service := value.(*JSService)
++
++	// 1) 冻结并排空：等待已排队/运行中的调用结束。超时则 unfreeze 回滚，
++	//    注册表与 worker 原封不动，插件继续正常服务。
++	drainTimeout := m.drainTimeout
++	if drainTimeout <= 0 {
++		drainTimeout = pluginDrainTimeout
++	}
++	if err := m.scheduler.DrainService(entryPath, drainTimeout); err != nil {
++		return fmt.Errorf("drain plugin calls before delete: %w", err)
++	}
++
++	// 2) 摘调度器并等待 worker 退出。排空已确认在途归零，这里不应触发超时；
++	//    万一失败（worker 被强制取消），把已停的 service 移出 map，保证不会
++	//    留下「还在跑却删了包」的状态，然后中止本次删除。
++	unregisterTimeout := m.unregisterTimeout
++	if unregisterTimeout <= 0 {
++		unregisterTimeout = pluginUnregisterTimeout
++	}
++	if err := m.scheduler.UnregisterService(entryPath, unregisterTimeout); err != nil {
++		m.services.Delete(entryPath)
++		return fmt.Errorf("unregister plugin scheduler: %w", err)
++	}
++
++	// 3) 停服：定时器处理器、onDeinit、后台进程、UDP/TCP socket、入站
++	//    WebSocket 与全部脚本环境。Stop 内部每一步都会执行，错误向上冒泡。
++	if err := service.Stop(); err != nil {
++		m.services.Delete(entryPath)
++		return fmt.Errorf("stop plugin service: %w", err)
++	}
++
++	m.services.Delete(entryPath)
++	return nil
++}
++
++// markDeleting 仅供包内测试/流程复用；正常入口是 DeletePlugin。
++func (m *Manager) markDeleting(entryPath string) bool {
++	_, exists := m.deleting.LoadOrStore(entryPath, struct{}{})
++	return !exists
++}
++
++// clearDeleting 放开删除阻断（仅供测试/回滚使用）。
++func (m *Manager) clearDeleting(entryPath string) {
++	m.deleting.Delete(entryPath)
++}
++
++// isDeleting 报告插件是否处于删除流程中（阶段 1 与阶段 2 期间均为 true）。
++func (m *Manager) isDeleting(entryPath string) bool {
++	_, ok := m.deleting.Load(entryPath)
++	return ok
++}
++
++// IsPluginDeleting 对外暴露的删除中判定，供 handler 在上传/更新等路径
++// 提前给出 409，避免等包管理器落盘阶段才失败。
++func (m *Manager) IsPluginDeleting(entryPath string) bool {
++	return m.isDeleting(entryPath)
++}
+diff --git a/internal/jsplugin/uninstall_state.go b/internal/jsplugin/uninstall_state.go
+new file mode 100644
+index 0000000..9bfca4f
+--- /dev/null
++++ b/internal/jsplugin/uninstall_state.go
+@@ -0,0 +1,236 @@
++package jsplugin
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"log/slog"
++	"os"
++	"path/filepath"
++	"slices"
++	"strings"
++	"time"
++
++	"songloft/internal/database"
++)
++
++// uninstallStateDir 是插件删除墓碑（tombstone）目录，位于 pluginsDir 下。
++// 目录名以点开头，SyncPluginsFromDirectory 只认 .jsplugin.zip 文件，不会误读。
++const uninstallStateDir = ".uninstall"
++
++// ErrPluginUninstalling 插件删除流程尚未收敛（墓碑仍在），任何安装/更新/重载
++// 尝试都必须拒绝，防止残留 ZIP 或新包与删除流程互相覆盖。
++var ErrPluginUninstalling = errors.New("jsplugin: plugin is being uninstalled")
++
++// pluginUninstallState 是删除流程的持久墓碑。
++//
++// 在任何破坏性操作（删 ZIP / 数据目录 / DB 记录）之前原子落盘；只有当三者都
++// 确认不存在后才删除墓碑。进程在任一阶段崩溃，或某一步在 Windows 上因句柄
++// 占用失败，下次启动由 RecoverPendingUninstalls 读到墓碑并继续收敛，保证：
++//   - 不留下「active 记录却没有包」的半卸载状态；
++//   - 残留 ZIP 不会被 SyncPluginsFromDirectory 当新插件重新安装；
++//   - keep_data=true 时数据目录在收敛中始终被保留。
++type pluginUninstallState struct {
++	EntryPath string `json:"entry_path"`
++	// FilePath 是删除开始时 DB 记录中的 ZIP 文件名（通常为 <entryPath>.jsplugin.zip）。
++	FilePath  string `json:"file_path"`
++	KeepData  bool   `json:"keep_data"`
++	CreatedAt string `json:"created_at"`
++	UpdatedAt string `json:"updated_at"`
++}
++
++// uninstallStatePath 返回墓碑文件路径。entryPath 已由 manifest 校验限定为
++// ^[a-z][a-z0-9-]*$，这里再做一层 filepath.Base 防御。
++func (pm *PackageManager) uninstallStatePath(entryPath string) string {
++	return filepath.Join(pm.pluginsDir, uninstallStateDir, filepath.Base(entryPath)+".json")
++}
++
++// saveUninstallState 原子写入墓碑（tmp 文件 + rename），崩溃只会出现
++// 「旧墓碑 / 新墓碑」二者之一，不会留下半截 JSON。
++func (pm *PackageManager) saveUninstallState(state *pluginUninstallState) error {
++	dir := filepath.Join(pm.pluginsDir, uninstallStateDir)
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return fmt.Errorf("create uninstall state dir: %w", err)
++	}
++
++	data, err := json.MarshalIndent(state, "", "  ")
++	if err != nil {
++		return fmt.Errorf("marshal uninstall state: %w", err)
++	}
++
++	final := pm.uninstallStatePath(state.EntryPath)
++	tmp := final + ".tmp"
++	if err := os.WriteFile(tmp, data, 0o644); err != nil {
++		return fmt.Errorf("write uninstall state temp file: %w", err)
++	}
++	if err := os.Rename(tmp, final); err != nil {
++		_ = os.Remove(tmp)
++		return fmt.Errorf("rename uninstall state file: %w", err)
++	}
++	return nil
++}
++
++// removeUninstallState 删除墓碑。文件不存在视为成功（幂等收敛）。
++func (pm *PackageManager) removeUninstallState(entryPath string) error {
++	err := os.Remove(pm.uninstallStatePath(entryPath))
++	if err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return nil
++}
++
++// hasUninstallState 报告指定插件是否有未收敛的删除墓碑。
++func (pm *PackageManager) hasUninstallState(entryPath string) bool {
++	_, err := os.Stat(pm.uninstallStatePath(entryPath))
++	return err == nil
++}
++
++// uninstallStateEntries 返回所有待收敛墓碑的 entryPath 集合。
++func (pm *PackageManager) uninstallStateEntries() map[string]bool {
++	entries := make(map[string]bool)
++	dir := filepath.Join(pm.pluginsDir, uninstallStateDir)
++	files, err := os.ReadDir(dir)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return entries
++		}
++		slog.Warn("read uninstall state dir failed", "dir", dir, "error", err)
++		return entries
++	}
++	for _, f := range files {
++		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
++			continue
++		}
++		entries[strings.TrimSuffix(f.Name(), ".json")] = true
++	}
++	return entries
++}
++
++// loadUninstallState 读取并校验单个墓碑；损坏的墓碑返回错误，由调用方记录并
++// 保留现场（不静默删除，避免丢删除意图）。
++func (pm *PackageManager) loadUninstallState(entryPath string) (*pluginUninstallState, error) {
++	data, err := os.ReadFile(pm.uninstallStatePath(entryPath))
++	if err != nil {
++		return nil, err
++	}
++	var state pluginUninstallState
++	if err := json.Unmarshal(data, &state); err != nil {
++		return nil, fmt.Errorf("parse uninstall state for %q: %w", entryPath, err)
++	}
++	if state.EntryPath == "" {
++		state.EntryPath = entryPath
++	}
++	if state.EntryPath != entryPath {
++		return nil, fmt.Errorf("uninstall state entry_path mismatch: file=%q content=%q", entryPath, state.EntryPath)
++	}
++	return &state, nil
++}
++
++// beginUninstall 在破坏性删除前落盘墓碑。墓碑已存在时视为幂等成功（重复删除
++// 或崩溃后的同进程重试），刷新 UpdatedAt。
++func (pm *PackageManager) beginUninstall(entryPath, filePath string, keepData bool) (*pluginUninstallState, error) {
++	now := time.Now().UTC().Format(time.RFC3339)
++	state := &pluginUninstallState{
++		EntryPath: entryPath,
++		FilePath:  filePath,
++		KeepData:  keepData,
++		CreatedAt: now,
++		UpdatedAt: now,
++	}
++	if existing, err := pm.loadUninstallState(entryPath); err == nil {
++		// 已存在墓碑：沿用原 CreatedAt 与 keep_data 语义（首次删除的意图优先），
++		// 只刷新目标 ZIP 文件名与更新时间。
++		state.CreatedAt = existing.CreatedAt
++		state.KeepData = existing.KeepData
++	}
++	if err := pm.saveUninstallState(state); err != nil {
++		return nil, err
++	}
++	return state, nil
++}
++
++// finishUninstall 按墓碑收敛删除，全程幂等，可在崩溃/失败后反复调用：
++//  1. 删除 ZIP（不存在视为成功）；
++//  2. keep_data=false 时删除插件数据目录（static/bin/cache 等，不存在视为成功）；
++//  3. 删除 js_plugins DB 记录（已不存在视为成功）；
++//  4. 全部确认后删除墓碑。
++//
++// 任一步失败立即返回错误并保留墓碑，等待下次调用（同进程重试或下次启动）。
++func (pm *PackageManager) finishUninstall(ctx context.Context, state *pluginUninstallState) error {
++	// [1] 删除 ZIP。墓碑记录的 FilePath 与约定文件名都尝试一遍，兼容历史数据。
++	zipNames := []string{filepath.Base(state.FilePath), state.EntryPath + ".jsplugin.zip"}
++	zipNames = slices.Compact(zipNames)
++	for _, name := range zipNames {
++		if name == "" || name == "." || filepath.IsAbs(name) {
++			continue
++		}
++		zipPath := filepath.Join(pm.pluginsDir, name)
++		if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
++			return fmt.Errorf("remove plugin zip %q: %w", zipPath, err)
++		}
++	}
++
++	// [2] 删除数据目录（keep_data=true 时保留；宿主 DB 中的 plugin_storage
++	// 沿用既有卸载保留语义，从来不在此处理）。
++	if !state.KeepData {
++		dataPath := filepath.Join(pm.dataDir, state.EntryPath)
++		if err := os.RemoveAll(dataPath); err != nil {
++			return fmt.Errorf("remove plugin data dir %q: %w", dataPath, err)
++		}
++	}
++
++	// [3] 删除 DB 记录（若仍存在）。
++	plugin, err := pm.repo.GetByEntryPath(ctx, state.EntryPath)
++	switch {
++	case err == nil && plugin != nil:
++		if err := pm.repo.Delete(ctx, plugin.ID); err != nil {
++			return fmt.Errorf("delete plugin record %q: %w", state.EntryPath, err)
++		}
++	case errors.Is(err, database.ErrNotFound):
++		// 记录已删，继续清理墓碑。
++	default:
++		return fmt.Errorf("lookup plugin record %q: %w", state.EntryPath, err)
++	}
++
++	// [4] 全部目标已不存在，最后删墓碑。删墓碑失败仅告警：所有删除目标已确认
++	// 消失，下次启动的收敛流程会再次走到这里并成功。
++	if err := pm.removeUninstallState(state.EntryPath); err != nil {
++		slog.Warn("remove uninstall state failed, will retry on next startup",
++			"entryPath", state.EntryPath, "error", err)
++	}
++	return nil
++}
++
++// RecoverPendingUninstalls 在启动扫描前收敛所有未完成的删除。
++// 返回成功收敛的插件 entryPath 列表；单个墓碑失败不阻断其他墓碑的收敛。
++func (pm *PackageManager) RecoverPendingUninstalls() ([]string, error) {
++	pending := pm.uninstallStateEntries()
++	if len(pending) == 0 {
++		return nil, nil
++	}
++
++	ctx := context.Background()
++	recovered := make([]string, 0, len(pending))
++	var errs []error
++	for entryPath := range pending {
++		state, err := pm.loadUninstallState(entryPath)
++		if err != nil {
++			// 损坏墓碑：保留现场并报错，不能一删了之（删除意图可能仍需收敛）。
++			errs = append(errs, err)
++			slog.Error("uninstall state unreadable, skipping recovery",
++				"entryPath", entryPath, "error", err)
++			continue
++		}
++		if err := pm.finishUninstall(ctx, state); err != nil {
++			errs = append(errs, err)
++			slog.Error("resume plugin uninstall failed",
++				"entryPath", entryPath, "keepData", state.KeepData, "error", err)
++			continue
++		}
++		slog.Info("resumed and completed plugin uninstall",
++			"entryPath", entryPath, "keepData", state.KeepData)
++		recovered = append(recovered, entryPath)
++	}
++	return recovered, errors.Join(errs...)
++}
+diff --git a/internal/jsplugin/uninstall_test.go b/internal/jsplugin/uninstall_test.go
+new file mode 100644
+index 0000000..e88387c
+--- /dev/null
++++ b/internal/jsplugin/uninstall_test.go
+@@ -0,0 +1,707 @@
++package jsplugin
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"songloft/internal/database"
++)
++
++// blockingHandler 用 gate 精确控制消息处理时机，用于调度器排空测试。
++type blockingHandler struct {
++	gate    chan struct{} // 关闭后 HandleMessage 才放行
++	mu      sync.Mutex
++	count   int
++	hasGate chan struct{} // 每次开始处理时发送一个信号（缓冲 1）
++}
++
++func newBlockingHandler() *blockingHandler {
++	return &blockingHandler{gate: make(chan struct{}), hasGate: make(chan struct{}, 64)}
++}
++
++func (h *blockingHandler) HandleMessage(msg *Message) *Message {
++	h.hasGate <- struct{}{}
++	<-h.gate
++	h.mu.Lock()
++	h.count++
++	h.mu.Unlock()
++	return &Message{ID: msg.ID, Session: msg.Session, Data: "ok"}
++}
++
++func (h *blockingHandler) calls() int {
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	return h.count
++}
++
++// TestScheduler_DrainService_WaitsInflight 验证排空等待在途消息全部处理完才返回，
++// 排空后新消息被拒绝。
++func TestScheduler_DrainService_WaitsInflight(t *testing.T) {
++	sched := NewServiceScheduler(1)
++	defer sched.Close()
++
++	h := newBlockingHandler()
++	if err := sched.RegisterService("svc", h, 16); err != nil {
++		t.Fatalf("register: %v", err)
++	}
++
++	// 1 个在途同步调用 + 3 个排队消息，全部被 gate 挡住。
++	callDone := make(chan error, 1)
++	go func() {
++		_, err := sched.Call(context.Background(), "svc", "", MsgHTTPRequest, "x", 5*time.Second)
++		callDone <- err
++	}()
++	<-h.hasGate // 等第一条真正开始处理，确保它在排空开始前已在途
++
++	for range 3 {
++		if err := sched.Send(&Message{Type: MsgLifecycle, Target: "svc"}); err != nil {
++			t.Fatalf("send queued: %v", err)
++		}
++	}
++
++	drainDone := make(chan error, 1)
++	go func() { drainDone <- sched.DrainService("svc", 3*time.Second) }()
++
++	// 排空开始与本 goroutine 无同步：freeze 之前探测消息可能被正常接收（计数），
++	// freeze 之后必须收到 ErrServiceUnregistered。
++	probeAccepted := 0
++	deadline := time.After(1 * time.Second)
++	rejected := false
++	for !rejected {
++		select {
++		case <-deadline:
++			t.Fatal("drain 期间新消息仍可入队，入口未冻结")
++		default:
++		}
++		if err := sched.Send(&Message{Type: MsgLifecycle, Target: "svc"}); err != nil {
++			if errors.Is(err, ErrServiceUnregistered) {
++				rejected = true
++				break
++			}
++			t.Fatalf("drain 期间意外错误: %v", err)
++		}
++		probeAccepted++
++		time.Sleep(2 * time.Millisecond)
++	}
++
++	// gate 未放行前排空不能成功。
++	select {
++	case err := <-drainDone:
++		t.Fatalf("仍有在途消息时 DrainService 却返回了: %v", err)
++	case <-time.After(50 * time.Millisecond):
++	}
++
++	close(h.gate)
++
++	select {
++	case err := <-drainDone:
++		if err != nil {
++			t.Fatalf("DrainService 应在全部消息处理完后成功: %v", err)
++		}
++	case <-time.After(3*time.Second + 100*time.Millisecond):
++		t.Fatal("DrainService 超时")
++	}
++
++	select {
++	case err := <-callDone:
++		if err != nil {
++			t.Fatalf("在途调用应正常拿到响应: %v", err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("在途调用未返回")
++	}
++
++	if got, want := h.calls(), 4+probeAccepted; got != want {
++		t.Errorf("排空应处理完 1 调用+3 排队+%d 探测 = %d 条消息，实际 %d",
++			probeAccepted, want, got)
++	}
++
++	// 排空成功后摘注册（关闭队列，worker 应立刻退出）。
++	if err := sched.UnregisterService("svc", time.Second); err != nil {
++		t.Fatalf("unregister after drain: %v", err)
++	}
++}
++
++// TestScheduler_DrainService_TimeoutRollback 验证排空超时后服务恢复接客，
++// 调用方可以据此中止卸载。
++func TestScheduler_DrainService_TimeoutRollback(t *testing.T) {
++	sched := NewServiceScheduler(1)
++	defer sched.Close()
++
++	h := newBlockingHandler()
++	if err := sched.RegisterService("svc", h, 16); err != nil {
++		t.Fatalf("register: %v", err)
++	}
++
++	go func() {
++		_, _ = sched.Call(context.Background(), "svc", "", MsgHTTPRequest, "x", 5*time.Second)
++	}()
++	<-h.hasGate
++
++	start := time.Now()
++	err := sched.DrainService("svc", 80*time.Millisecond)
++	if !errors.Is(err, ErrDrainTimeout) {
++		t.Fatalf("期望 ErrDrainTimeout，got %v", err)
++	}
++	if d := time.Since(start); d > 800*time.Millisecond {
++		t.Errorf("排空超时应在 ~80ms 返回，实际 %v", d)
++	}
++
++	// 回滚后放行长任务，服务应能继续处理新消息。
++	close(h.gate)
++	deadline := time.After(3 * time.Second)
++	for h.calls() < 1 {
++		select {
++		case <-deadline:
++			t.Fatal("在途消息未处理完")
++		default:
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++
++	if err := sched.Send(&Message{Type: MsgLifecycle, Target: "svc"}); err != nil {
++		t.Fatalf("排空超时回滚后服务应恢复接客，Send 失败: %v", err)
++	}
++	deadline = time.After(3 * time.Second)
++	for h.calls() < 2 {
++		select {
++		case <-deadline:
++			t.Fatal("回滚后新消息未被处理")
++		default:
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++}
++
++// slowPluginJS 提供一个 ~1.2s 的慢端点与即时端点。
++const slowPluginJS = `
++function onInit() {}
++function onDeinit() {}
++async function onHTTPRequest(req) {
++    if (req.path === "/slow") {
++        await new Promise(function(r) { setTimeout(r, 1200); });
++        return {statusCode: 200, headers: {"Content-Type": "application/json"}, body: '{"ok":"slow"}'};
++    }
++    return {statusCode: 200, headers: {"Content-Type": "application/json"}, body: '{"hello":"world"}'};
++}
++`
++
++// setupLoadedPlugin 安装并加载一个可用的测试插件，返回 manager 与记录。
++func setupLoadedPlugin(t *testing.T, entryPath, jsCode string, publicPaths []string) (*Manager, *JSPlugin, string, string) {
++	t.Helper()
++
++	pluginsDir, dataDir, repo, _ := setupTestEnv(t)
++	manifest := testManifest(entryPath)
++	manifest.PublicPaths = publicPaths
++	zipData := createTestPluginZipWithStatic(t, manifest, jsCode, map[string]string{
++		"index.html": "<head></head><body>plugin page</body>",
++	})
++	plugin, _, err := NewPackageManager(pluginsDir, dataDir, repo).InstallFromUpload(zipData)
++	if err != nil {
++		t.Skipf("InstallFromUpload failed (may need QuickJS toolchain): %v", err)
++	}
++
++	manager := NewManager(repo, pluginsDir, dataDir, "", nil, nil)
++	t.Cleanup(func() { manager.Close() })
++
++	if err := manager.EnablePlugin(context.Background(), plugin.ID); err != nil {
++		t.Skipf("EnablePlugin failed (may need QuickJS runtime): %v", err)
++	}
++	if _, ok := manager.GetService(entryPath); !ok {
++		t.Skip("plugin service not loaded, skip QuickJS-dependent test")
++	}
++	return manager, plugin, pluginsDir, dataDir
++}
++
++func pluginPing(t *testing.T, m *Manager, entryPath string) {
++	t.Helper()
++	status, _, body, err := m.InvokeHTTP(context.Background(), entryPath, "GET", "/ping", nil, nil)
++	if err != nil {
++		t.Fatalf("InvokeHTTP /ping: %v", err)
++	}
++	if status != 200 {
++		t.Fatalf("期望 200，got %d body=%s", status, string(body))
++	}
++}
++
++func assertPluginGone(t *testing.T, m *Manager, pm *PackageManager, plugin *JSPlugin, pluginsDir, dataDir string, keepData bool) {
++	t.Helper()
++	entryPath := plugin.EntryPath
++
++	if _, err := os.Stat(filepath.Join(pluginsDir, plugin.FilePath)); !os.IsNotExist(err) {
++		t.Errorf("ZIP 应已删除: %v", err)
++	}
++	if _, err := m.repo.GetByEntryPath(context.Background(), entryPath); !errors.Is(err, database.ErrNotFound) {
++		t.Errorf("DB 记录应已删除，got err=%v", err)
++	}
++	if _, ok := m.GetService(entryPath); ok {
++		t.Error("services map 不应再有该插件")
++	}
++	if m.scheduler.HasService(entryPath) {
++		t.Error("scheduler 不应再有该插件")
++	}
++	_, lyricOK := m.lyricProviders.Load(entryPath)
++	_, coverOK := m.coverProviders.Load(entryPath)
++	_, subOK := m.playEventSubscribers.Load(entryPath)
++	if lyricOK || coverOK || subOK {
++		t.Errorf("提供者/订阅注册应已清除: lyric=%v cover=%v sub=%v", lyricOK, coverOK, subOK)
++	}
++	if m.IsPublicPath("/api/v1/jsplugin/" + entryPath + "/api/callback") {
++		t.Error("publicPaths 应已移除")
++	}
++	if m.IsPluginDeleting(entryPath) {
++		t.Error("删除成功后 deleting 标记应清除")
++	}
++	if pm.hasUninstallState(entryPath) {
++		t.Error("删除成功后墓碑应已清除")
++	}
++	pluginDataDir := filepath.Join(dataDir, entryPath)
++	if _, err := os.Stat(pluginDataDir); keepData && os.IsNotExist(err) {
++		t.Error("keep_data=true 时插件数据目录应保留")
++	} else if !keepData && err == nil {
++		t.Error("默认删除时插件数据目录应已删除")
++	}
++}
++
++// TestDeletePlugin_FullLifecycle 端到端：运行中插件删除后，运行态注册、
++// 文件、DB、墓碑、publicPaths 全部清空，且同 entryPath 可立即重装。
++func TestDeletePlugin_FullLifecycle(t *testing.T) {
++	entryPath := "test-del-full"
++	m, plugin, pluginsDir, dataDir := setupLoadedPlugin(t, entryPath, simpleJSCode, []string{"/api/callback"})
++	pm := m.packager
++
++	pluginPing(t, m, entryPath)
++
++	// 挂上三类运行态注册。
++	m.RegisterLyricProvider(entryPath)
++	m.RegisterCoverProvider(entryPath)
++	m.RegisterPlayEvent(entryPath)
++	m.RefreshPublicPaths()
++	if !m.IsPublicPath("/api/v1/jsplugin/" + entryPath + "/api/callback") {
++		t.Fatal("删除前 publicPath 应命中")
++	}
++
++	if _, err := m.DeletePlugin(context.Background(), plugin.ID, false); err != nil {
++		t.Fatalf("DeletePlugin: %v", err)
++	}
++
++	assertPluginGone(t, m, pm, plugin, pluginsDir, dataDir, false)
++
++	// 删除后公开路由立即 404（EnsureLoaded 拒绝）。
++	if _, err := m.EnsureLoaded(context.Background(), entryPath); !errors.Is(err, ErrPluginNotFound) {
++		t.Errorf("删除后 EnsureLoaded 应 ErrPluginNotFound，got %v", err)
++	}
++
++	// 同一 entryPath 重新安装并正常工作。
++	manifest := testManifest(entryPath)
++	manifest.PublicPaths = []string{"/api/callback"}
++	zipData := createTestPluginZipWithStatic(t, manifest, simpleJSCode, map[string]string{
++		"index.html": "<head></head><body>reinstalled</body>",
++	})
++	newPlugin, _, err := pm.InstallFromUpload(zipData)
++	if err != nil {
++		t.Fatalf("同 entryPath 重装被拒: %v", err)
++	}
++	if err := m.EnablePlugin(context.Background(), newPlugin.ID); err != nil {
++		t.Fatalf("重装后 EnablePlugin: %v", err)
++	}
++	pluginPing(t, m, entryPath)
++}
++
++// TestDeletePlugin_KeepData 验证 keep_data=true 保留数据目录，默认删除。
++func TestDeletePlugin_KeepData(t *testing.T) {
++	entryPath := "test-del-keepdata"
++	m, plugin, pluginsDir, dataDir := setupLoadedPlugin(t, entryPath, simpleJSCode, nil)
++
++	if _, err := m.DeletePlugin(context.Background(), plugin.ID, true); err != nil {
++		t.Fatalf("DeletePlugin keepData: %v", err)
++	}
++	assertPluginGone(t, m, m.packager, plugin, pluginsDir, dataDir, true)
++
++	// 显式核对保留下来的数据内容。
++	index := filepath.Join(dataDir, entryPath, "static", "index.html")
++	if _, err := os.Stat(index); err != nil {
++		t.Fatalf("keep_data=true 应保留 static/index.html: %v", err)
++	}
++}
++
++// TestDeletePlugin_NotLoaded 未加载（空闲驱逐/从未加载）的插件也应能完整删除。
++func TestDeletePlugin_NotLoaded(t *testing.T) {
++	pluginsDir, dataDir, repo, _ := setupTestEnv(t)
++	manifest := testManifest("test-del-unloaded")
++	zipData := createTestPluginZipWithStatic(t, manifest, simpleJSCode, nil)
++	pm := NewPackageManager(pluginsDir, dataDir, repo)
++	plugin, _, err := pm.InstallFromUpload(zipData)
++	if err != nil {
++		t.Fatalf("install: %v", err)
++	}
++
++	manager := NewManager(repo, pluginsDir, dataDir, "", nil, nil)
++	t.Cleanup(func() { manager.Close() })
++
++	if _, err := manager.DeletePlugin(context.Background(), plugin.ID, false); err != nil {
++		t.Fatalf("DeletePlugin: %v", err)
++	}
++	assertPluginGone(t, manager, pm, plugin, pluginsDir, dataDir, false)
++}
++
++// TestDeletePlugin_DrainTimeoutAborts 慢请求未排空时删除必须失败：
++// 删除窗口内新请求被拒绝；超时后错误可观察，ZIP/记录/服务原样保留并继续可用。
++func TestDeletePlugin_DrainTimeoutAborts(t *testing.T) {
++	entryPath := "test-del-drain"
++	m, plugin, _, _ := setupLoadedPlugin(t, entryPath, slowPluginJS, nil)
++	m.drainTimeout = 200 * time.Millisecond
++
++	// 发起 ~1.2s 的慢调用。
++	slowDone := make(chan error, 1)
++	go func() {
++		_, _, _, err := m.InvokeHTTP(context.Background(), entryPath, "GET", "/slow", nil, nil)
++		slowDone <- err
++	}()
++	time.Sleep(150 * time.Millisecond) // 等慢调用进入 worker
++
++	// 发起删除：它会停在排空阶段（慢调用还有 ~1s）。
++	deleteDone := make(chan error, 1)
++	go func() {
++		_, delErr := m.DeletePlugin(context.Background(), plugin.ID, false)
++		deleteDone <- delErr
++	}()
++	deadline := time.After(2 * time.Second)
++	for !m.IsPluginDeleting(entryPath) {
++		select {
++		case <-deadline:
++			t.Fatal("删除未进入 deleting 态")
++		default:
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++
++	// 删除窗口内新请求应立即被阻断（ErrPluginNotFound，路由层映射为 404）。
++	if _, err := m.EnsureLoaded(context.Background(), entryPath); !errors.Is(err, ErrPluginNotFound) {
++		t.Fatalf("删除窗口内 EnsureLoaded 应返回 ErrPluginNotFound，got %v", err)
++	}
++
++	start := time.Now()
++	select {
++	case err := <-deleteDone:
++		if !errors.Is(err, ErrDrainTimeout) {
++			t.Fatalf("期望 ErrDrainTimeout，got %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("删除未在排空预算后返回")
++	}
++	if d := time.Since(start); d > time.Second {
++		t.Errorf("应在排空预算 ~200ms 后返回，实际 %v", d)
++	}
++
++	// 文件与记录原样保留。
++	if _, statErr := os.Stat(filepath.Join(m.pluginsDir, plugin.FilePath)); statErr != nil {
++		t.Errorf("排空失败不应删除 ZIP: %v", statErr)
++	}
++	if _, err := m.repo.GetByEntryPath(context.Background(), entryPath); err != nil {
++		t.Fatalf("排空失败不应删除 DB 记录: %v", err)
++	}
++	if m.IsPluginDeleting(entryPath) {
++		t.Error("失败回滚后 deleting 标记应清除，插件恢复可用")
++	}
++
++	// 慢调用正常完成；之后插件照常服务（排空超时已回滚）。
++	select {
++	case err := <-slowDone:
++		if err != nil {
++			t.Fatalf("在途慢调用应在 worker 上跑完，不应被取消: %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("在途慢调用未完成")
++	}
++	pluginPing(t, m, entryPath)
++}
++
++// TestDeletePlugin_ConcurrentRejects 并发删除同一插件，第二个拿到 409 语义错误。
++func TestDeletePlugin_ConcurrentRejects(t *testing.T) {
++	entryPath := "test-del-concurrent"
++	m, plugin, _, _ := setupLoadedPlugin(t, entryPath, slowPluginJS, nil)
++	m.drainTimeout = 2 * time.Second
++
++	go func() {
++		_, _, _, _ = m.InvokeHTTP(context.Background(), entryPath, "GET", "/slow", nil, nil)
++	}()
++	time.Sleep(150 * time.Millisecond)
++
++	errCh := make(chan error, 1)
++	go func() {
++		_, err := m.DeletePlugin(context.Background(), plugin.ID, false)
++		errCh <- err
++	}()
++
++	// 等第一个删除进入阻断态。
++	deadline := time.After(2 * time.Second)
++	for !m.IsPluginDeleting(entryPath) {
++		select {
++		case <-deadline:
++			t.Fatal("第一个删除未进入 deleting 态")
++		default:
++			time.Sleep(5 * time.Millisecond)
++		}
++	}
++
++	_, err := m.DeletePlugin(context.Background(), plugin.ID, false)
++	if !errors.Is(err, ErrPluginDeleting) {
++		t.Fatalf("并发删除应返回 ErrPluginDeleting，got %v", err)
++	}
++
++	// 等慢调用结束，第一个删除成功收敛。
++	select {
++	case err := <-errCh:
++		if err != nil {
++			t.Fatalf("第一个删除应成功: %v", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("第一个删除未完成")
++	}
++}
++
++// --- 墓碑持久化与崩溃恢复 ---
++
++func installForRecoveryTest(t *testing.T, entryPath string) (*PackageManager, *JSPlugin, string, string) {
++	t.Helper()
++	pluginsDir, dataDir, repo, _ := setupTestEnv(t)
++	pm := NewPackageManager(pluginsDir, dataDir, repo)
++	manifest := testManifest(entryPath)
++	zipData := createTestPluginZipWithStatic(t, manifest, simpleJSCode, map[string]string{
++		"index.html": "<head></head><body>x</body>",
++	})
++	plugin, _, err := pm.InstallFromUpload(zipData)
++	if err != nil {
++		t.Fatalf("install: %v", err)
++	}
++	return pm, plugin, pluginsDir, dataDir
++}
++
++// TestRecovery_AfterZipRemovedCrash 模拟「墓碑已写、ZIP 已删、进程中断，
++// DB 记录还在」：下次启动必须收敛为完整删除（记录与数据目录都清掉）。
++func TestRecovery_AfterZipRemovedCrash(t *testing.T) {
++	entryPath := "test-rec-zip"
++	pm, plugin, pluginsDir, dataDir := installForRecoveryTest(t, entryPath)
++
++	if _, err := pm.beginUninstall(entryPath, plugin.FilePath, false); err != nil {
++		t.Fatalf("begin: %v", err)
++	}
++	if err := os.Remove(filepath.Join(pluginsDir, plugin.FilePath)); err != nil {
++		t.Fatalf("remove zip: %v", err)
++	}
++
++	// 新 PackageManager 模拟进程重启。
++	restarted := NewPackageManager(pluginsDir, dataDir, pm.repo)
++	recovered, err := restarted.RecoverPendingUninstalls()
++	if err != nil {
++		t.Fatalf("RecoverPendingUninstalls: %v", err)
++	}
++	if len(recovered) != 1 || recovered[0] != entryPath {
++		t.Fatalf("应收敛 1 个墓碑，got %v", recovered)
++	}
++	if _, err := pm.repo.GetByEntryPath(context.Background(), entryPath); !errors.Is(err, database.ErrNotFound) {
++		t.Fatalf("记录应删除: %v", err)
++	}
++	if _, err := os.Stat(filepath.Join(dataDir, entryPath)); !os.IsNotExist(err) {
++		t.Fatal("数据目录应删除")
++	}
++	if restarted.hasUninstallState(entryPath) {
++		t.Fatal("收敛后墓碑应删除")
++	}
++}
++
++// TestRecovery_ResidualZipNotReinstalled 「记录已删、ZIP 残留 + 墓碑」场景：
++// 启动扫描不得把残留 ZIP 当新插件安装；恢复后 ZIP 被删除。
++func TestRecovery_ResidualZipNotReinstalled(t *testing.T) {
++	entryPath := "test-rec-residual"
++	pm, plugin, pluginsDir, _ := installForRecoveryTest(t, entryPath)
++
++	// 先写墓碑、删记录，ZIP 保留——模拟在「删记录之后、删 ZIP 之前」崩溃
++	// （实际实现先删 ZIP，此测试同时验证乱序场景也能收敛）。
++	if _, err := pm.beginUninstall(entryPath, plugin.FilePath, false); err != nil {
++		t.Fatalf("begin: %v", err)
++	}
++	if err := pm.repo.Delete(context.Background(), plugin.ID); err != nil {
++		t.Fatalf("delete record: %v", err)
++	}
++
++	// 扫描时墓碑仍在：残留 ZIP 必须被跳过，不得重装。
++	synced, err := pm.SyncPluginsFromDirectory()
++	if err != nil {
++		t.Fatalf("sync: %v", err)
++	}
++	for _, p := range synced {
++		if p.EntryPath == entryPath {
++			t.Fatal("带墓碑的残留 ZIP 不应被启动扫描重新安装")
++		}
++	}
++	if _, err := pm.repo.GetByEntryPath(context.Background(), entryPath); !errors.Is(err, database.ErrNotFound) {
++		t.Fatal("记录不应被扫描重建")
++	}
++
++	// 恢复收敛：ZIP 与墓碑消失。
++	recovered, err := pm.RecoverPendingUninstalls()
++	if err != nil {
++		t.Fatalf("recover: %v", err)
++	}
++	if len(recovered) != 1 {
++		t.Fatalf("应收敛 1 个，got %v", recovered)
++	}
++	if _, err := os.Stat(filepath.Join(pluginsDir, plugin.FilePath)); !os.IsNotExist(err) {
++		t.Fatal("残留 ZIP 应被恢复流程删除")
++	}
++
++	// 再扫描也不会复活。
++	synced2, _ := pm.SyncPluginsFromDirectory()
++	for _, p := range synced2 {
++		if p.EntryPath == entryPath {
++			t.Fatal("收敛后扫描不应再出现该插件")
++		}
++	}
++}
++
++// TestRecovery_KeepData 墓碑 keep_data=true 时收敛保留数据目录。
++func TestRecovery_KeepData(t *testing.T) {
++	entryPath := "test-rec-keep"
++	pm, plugin, _, dataDir := installForRecoveryTest(t, entryPath)
++
++	if _, err := pm.beginUninstall(entryPath, plugin.FilePath, true); err != nil {
++		t.Fatalf("begin: %v", err)
++	}
++	if _, err := pm.RecoverPendingUninstalls(); err != nil {
++		t.Fatalf("recover: %v", err)
++	}
++	if _, err := os.Stat(filepath.Join(dataDir, entryPath, "static", "index.html")); err != nil {
++		t.Fatalf("keep_data=true 的数据目录应保留: %v", err)
++	}
++	if _, err := pm.repo.GetByEntryPath(context.Background(), entryPath); !errors.Is(err, database.ErrNotFound) {
++		t.Fatal("记录仍应删除")
++	}
++}
++
++// TestUninstall_RetryAfterFailure 模拟文件系统部分失败：ZIP 路径被目录占用导致
++// 删除失败，错误必须可观察、墓碑与记录保留；排除故障后重试（同进程/重启）收敛。
++func TestUninstall_RetryAfterFailure(t *testing.T) {
++	entryPath := "test-del-retry"
++	pm, plugin, pluginsDir, _ := installForRecoveryTest(t, entryPath)
++
++	// 用「非空同名目录」占位 ZIP 路径：os.Remove 能删空目录，但删不掉非空目录，
++	// 稳定制造文件系统失败（Windows/Linux 行为一致）。
++	zipPath := filepath.Join(pluginsDir, plugin.FilePath)
++	if err := os.Remove(zipPath); err != nil {
++		t.Fatalf("setup remove zip: %v", err)
++	}
++	if err := os.MkdirAll(zipPath, 0o755); err != nil {
++		t.Fatalf("mkdir blocking zip path: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(zipPath, "locked.txt"), []byte("x"), 0o644); err != nil {
++		t.Fatalf("write blocker file: %v", err)
++	}
++
++	err := pm.Uninstall(plugin.ID, false)
++	if err == nil {
++		t.Fatal("ZIP 删除失败时 Uninstall 必须返回错误")
++	}
++	if !pm.hasUninstallState(entryPath) {
++		t.Error("失败后墓碑必须保留")
++	}
++	if _, err := pm.repo.GetByEntryPath(context.Background(), entryPath); err != nil {
++		t.Fatalf("失败后 DB 记录必须保留: %v", err)
++	}
++
++	// 排除故障后模拟重启继续收敛。
++	if err := os.RemoveAll(zipPath); err != nil {
++		t.Fatalf("remove blocking dir: %v", err)
++	}
++	restarted := NewPackageManager(pluginsDir, pm.dataDir, pm.repo)
++	if _, err := restarted.RecoverPendingUninstalls(); err != nil {
++		t.Fatalf("重启收敛: %v", err)
++	}
++	if _, err := pm.repo.GetByEntryPath(context.Background(), entryPath); !errors.Is(err, database.ErrNotFound) {
++		t.Fatalf("重试后记录应删除: %v", err)
++	}
++}
++
++// TestInstall_RejectedWhileTombstone 墓碑未收敛期间，安装/更新同 entryPath 被拒。
++func TestInstall_RejectedWhileTombstone(t *testing.T) {
++	entryPath := "test-tomb-install"
++	pm, plugin, _, _ := installForRecoveryTest(t, entryPath)
++
++	if _, err := pm.beginUninstall(entryPath, plugin.FilePath, false); err != nil {
++		t.Fatalf("begin: %v", err)
++	}
++
++	manifest := testManifest(entryPath)
++	zipData := createTestPluginZip(t, manifest, simpleJSCode)
++	if _, _, err := pm.InstallFromUpload(zipData); !errors.Is(err, ErrPluginUninstalling) {
++		t.Fatalf("墓碑存在时安装应返回 ErrPluginUninstalling，got %v", err)
++	}
++}
++
++// TestPackageManager_InstallGuard 内存守卫拦截删除阶段 1（墓碑未落盘）的覆盖安装。
++func TestPackageManager_InstallGuard(t *testing.T) {
++	entryPath := "test-guard"
++	m, plugin, _, _ := setupLoadedPlugin(t, entryPath, simpleJSCode, nil)
++
++	manifest := testManifest(entryPath)
++	zipData := createTestPluginZip(t, manifest, simpleJSCode)
++
++	if !m.markDeleting(entryPath) {
++		t.Fatal("markDeleting 应首次成功")
++	}
++	if _, _, err := m.packager.InstallFromUpload(zipData); !errors.Is(err, ErrPluginDeleting) {
++		t.Fatalf("删除窗口内安装应被内存守卫拒绝 ErrPluginDeleting，got %v", err)
++	}
++	if _, err := m.packager.Update(plugin.ID, zipData); !errors.Is(err, ErrPluginDeleting) {
++		t.Fatalf("删除窗口内覆盖更新应被内存守卫拒绝 ErrPluginDeleting，got %v", err)
++	}
++	m.clearDeleting(entryPath)
++
++	// 守卫放开后更新路径恢复可用（更新成功后恢复插件状态）。
++	if _, err := m.packager.Update(plugin.ID, zipData); err != nil {
++		t.Fatalf("删除标记清除后更新应恢复正常: %v", err)
++	}
++}
++
++// TestIsPublicPath_DeletingFilter 删除窗口内 publicPaths 立即失效，
++// 不依赖 DB 记录删除与 RefreshPublicPaths。
++func TestIsPublicPath_DeletingFilter(t *testing.T) {
++	pluginsDir, dataDir, repo, _ := setupTestEnv(t)
++	m := NewManager(repo, pluginsDir, dataDir, "", nil, nil)
++	t.Cleanup(func() { m.Close() })
++
++	entryPath := "test-pubpath-del"
++	plugin := &JSPlugin{
++		Name: "p", Version: "1.0.0", EntryPath: entryPath, Main: "main.js",
++		Permissions: []string{}, PublicPaths: []string{"/api/callback"},
++		Status: JSPluginStatusActive, FilePath: entryPath + ".jsplugin.zip",
++	}
++	if err := repo.Create(context.Background(), plugin); err != nil {
++		t.Fatalf("create: %v", err)
++	}
++	m.RefreshPublicPaths()
++	publicURL := "/api/v1/jsplugin/" + entryPath + "/api/callback"
++	if !m.IsPublicPath(publicURL) {
++		t.Fatal("删除前 publicPath 应命中")
++	}
++
++	if !m.markDeleting(entryPath) {
++		t.Fatal("markDeleting 应首次成功")
++	}
++	t.Cleanup(func() { m.clearDeleting(entryPath) })
++	if m.IsPublicPath(publicURL) {
++		t.Fatal("删除窗口内 publicPath 必须立即失效")
++	}
++	if !m.isDeletingPluginPath("/api/v1/jsplugin/" + entryPath + "/static/x.js") {
++		t.Fatal("删除窗口内静态子路径应被识别为删除中")
++	}
++	if m.isDeletingPluginPath("/api/v1/jsplugin/other/api/callback") {
++		t.Fatal("不应误伤其他插件路径")
++	}
++}
