@@ -19,6 +19,7 @@ type Querier interface {
 	ClearPlayHistory(ctx context.Context, arg ClearPlayHistoryParams) (int64, error)
 	ClearPlayHistoryByPlaylist(ctx context.Context, contextKey string) (int64, error)
 	ClearPlayHistoryByTag(ctx context.Context, contextKey string) (int64, error)
+	ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error)
 	CountArtistSongs(ctx context.Context, artistID int64) (int64, error)
 	CountLocalFingerprints(ctx context.Context) (CountLocalFingerprintsRow, error)
 	CountPlayHistory(ctx context.Context, arg CountPlayHistoryParams) (int64, error)
@@ -50,6 +51,7 @@ type Querier interface {
 	FindPlaylistByNameExcludeID(ctx context.Context, arg FindPlaylistByNameExcludeIDParams) (int64, error)
 	FindSongByDedupKey(ctx context.Context, arg FindSongByDedupKeyParams) (int64, error)
 	FindSongPositionInPlaylist(ctx context.Context, arg FindSongPositionInPlaylistParams) (int64, error)
+	GetActiveTokenIDsBySession(ctx context.Context, arg GetActiveTokenIDsBySessionParams) ([]string, error)
 	GetArtistByName(ctx context.Context, name string) (Artist, error)
 	GetArtistByNormalizedKey(ctx context.Context, normalizedKey string) (Artist, error)
 	GetArtistsBySongID(ctx context.Context, songID int64) ([]GetArtistsBySongIDRow, error)
@@ -97,6 +99,7 @@ type Querier interface {
 	RecordPlay(ctx context.Context, arg RecordPlayParams) error
 	RemoveSongFromPlaylist(ctx context.Context, arg RemoveSongFromPlaylistParams) (int64, error)
 	ResetFailedFingerprintAttempts(ctx context.Context) error
+	RevokeActiveTokensBySession(ctx context.Context, arg RevokeActiveTokensBySessionParams) (int64, error)
 	RevokeToken(ctx context.Context, arg RevokeTokenParams) (int64, error)
 	SetConfig(ctx context.Context, arg SetConfigParams) error
 	SetPlaylistPinned(ctx context.Context, arg SetPlaylistPinnedParams) (int64, error)

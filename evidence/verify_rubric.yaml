@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 正常刷新会返回一套完整的新 access 和 refresh token，旧 refresh 在提交后立即且持续被拒绝，响应字段和有效期语义正确。
+  - id: 2
+    type: f2p
+    text: 同一 refresh token 的并发请求中恰好一个成功，只产生一套持久且活动的后继令牌，其他请求得到已消费类结果。
+  - id: 3
+    type: f2p
+    text: 在旧令牌消费、新 access 写入、新 refresh 写入或事务提交处注入失败时整体回滚，不留下孤立记录，未提交的旧 refresh 仍可重试。
+  - id: 4
+    type: f2p
+    text: 随机会话身份在多次刷新后保持不变，客户端描述信息不被当成会话标识，相同 User-Agent 的两次独立登录始终隔离。
+  - id: 5
+    type: f2p
+    text: 登出一个会话会撤销该会话当前的 access token 和 refresh 链，但不会撤销相同 User-Agent 下另一次登录的令牌。
+  - id: 6
+    type: f2p
+    text: 重建 AuthService 或重启进程后，已提交消费的 refresh 仍被拒绝，回滚事务中的 refresh 仍可用，缓存与数据库状态一致。
+  - id: 7
+    type: p2p
+    text: 普通登录与单次刷新、access 和 refresh 类型校验、既有响应结构和有效期、令牌列表撤销接口及插件系统令牌行为保持兼容。

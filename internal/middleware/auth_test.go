@@ -29,7 +29,7 @@ func newAuthServiceForTest(t *testing.T) *services.AuthService {
 		t.Fatalf("seed jwt_secret: %v", err)
 	}
 
-	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb.TokenRepository(), "testuser", "testpass")
+	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "testuser", "testpass")
 	if err != nil {
 		t.Fatalf("create auth service: %v", err)
 	}

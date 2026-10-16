@@ -1,0 +1,1562 @@
+diff --git a/LESSONS.en.md b/LESSONS.en.md
+index a584bb9..1fd0766 100644
+--- a/LESSONS.en.md
++++ b/LESSONS.en.md
+@@ -27,6 +27,15 @@ Evidence-backed lessons for the parent and public host contracts; see the [AI wo
+ - Done right: retain the first failure, actual SHA, and rerun result. A lifecycle fix should verify that no cache writes occur after shutdown returns, then clean the temporary directory. Do not treat one successful rerun as proof of repair.
+ - Seen 1× (2026-10-14). Status: lesson; lifecycle repair remains pending.
+ 
++### AUTH-001: Refresh token rotation must be conditionally consumed inside a transaction; keep session identity separate from display info
++
++- Scope: authentication module in the parent repository (`internal/services/auth_service.go`, `auth_tokens` in `internal/database`).
++- Rules: (1) concurrency safety cannot rely on a check-then-act `IsRevoked`→`Revoke` sequence. Inside `RunInTx`, a guarded conditional UPDATE (`token_type='refresh' AND revoked_at IS NULL AND expires_at >= ?`) must be the **first statement** that atomically consumes the token; zero rows means reuse/invalid, after which persistent state is read and classified as consumed/revoked/expired/wrong-type. (2) Old-refresh consumption and new access/refresh inserts commit in the same transaction; any failure rolls back completely, and the uncommitted old refresh must stay retryable. (3) Session identity is a random value generated at login, persisted in its own `session_id` column and stable across rotations; `client_info` such as User-Agent is display-only and must never be the session key (same-UA independent logins are different sessions; logout revokes by session). (4) Distinguish invalid credentials (401) from storage failures (500) with sentinel errors; DB errors must never map to credential errors.
++- Failure: on 2026-10-14, `RefreshToken` at baseline `6b050ff` was a non-transactional IsRevoked→Get→Revoke→two Creates sequence: concurrent refreshes of the same token could each pass the check and mint multiple still-valid token sets; a failed Create left the old refresh revoked with no new pair, deadlocking the session; after rotation the new JWT `client_id` was set to the old row's `client_info` (UA), so two independent sessions with the same UA revoked each other's refresh tokens at logout.
++- Fix: uncommitted working tree (baseline `6b050ff`). Migration `0040_auth_token_session.sql` adds `session_id`; fixed SQL `ConsumeRefreshToken`/`RevokeActiveTokensBySession`; login and rotation commit in a single transaction; sentinel errors `ErrInvalidRefreshToken`/`ErrRefreshTokenConsumed` etc., with the handler mapping 401/500 via `errors.Is`; legacy rows with empty `session_id` keep the old logout path and start a fresh chain on next rotation.
++- Done right: `TestRefreshToken_ConcurrentSameRefresh` (file DB, 24 goroutines — exactly one succeeds, all others consumed), `TestRefreshToken_ConsumedStateSurvivesRestart` (reopened DB + new AuthService still rejects the consumed token while the chain head rotates), `TestRefreshToken_RollbackKeepsRefreshRetryable`, and `TestLogout_SessionIsolationSameUA` pass, including under `go test -race`; handler tests confirm 401 with an explicit "already used" message for reuse and 500 for a closed database.
++- Seen 1× (2026-10-14). Status: lesson.
++
+ ## Entry Format
+ 
+ ```text
+diff --git a/LESSONS.md b/LESSONS.md
+index ad96847..f1cceb2 100644
+--- a/LESSONS.md
++++ b/LESSONS.md
+@@ -27,6 +27,15 @@
+ - Done right：保留首轮失败、实际 SHA 与重跑结果；若修复生命周期，验证关闭返回后不再写缓存，再清理临时目录，不把单次重跑当成修复证明。
+ - Seen 1× (2026-10-14)。状态：经验，生命周期修复待处理。
+ 
++### AUTH-001：refresh token 轮换必须事务内条件消费，会话身份与展示信息分离
++
++- 范围：主仓库认证模块（`internal/services/auth_service.go`、`internal/database` 的 `auth_tokens`）。
++- 规则：① 并发安全不能靠「先 `IsRevoked` 再 `Revoke`」的检查-执行序列，必须在 `RunInTx` 内把带守卫（`token_type='refresh' AND revoked_at IS NULL AND expires_at >= ?`）的条件 UPDATE 作为**第一条语句**原子消费，命中 0 行即复用/失效，再读持久状态分类为「已消费/已撤销/已过期/类型错误」；② 旧 refresh 消费与新 access/refresh 写入同一事务共同提交，任何失败整体回滚，未提交的旧 refresh 必须保持可重试；③ 会话身份是登录时生成、持久化并跨轮换稳定的独立列（`session_id`），User-Agent 等 `client_info` 只用于展示，绝不能充当会话键（相同 UA 的独立登录必须是不同会话，登出按会话撤销）；④ 用哨兵错误区分凭证无效（401）与存储故障（500），DB 错误不得被映射成凭证错误。
++- 失败：2026-10-14，基线 `6b050ff` 的 `RefreshToken` 为 IsRevoked→Get→Revoke→两次 Create 的非事务序列：同一 refresh 并发刷新可各自通过检查并生成多套仍有效的令牌；Create 失败时旧 refresh 已撤销而新令牌缺失，会话被锁死；刷新后新 JWT 的 `client_id` 被写成旧行的 `client_info`（UA），导致相同 UA 的两个独立会话在登出时按 UA 匹配而互相撤销 refresh。
++- 修复：未提交工作树（基线 `6b050ff`）。迁移 `0040_auth_token_session.sql` 增加 `session_id`；`ConsumeRefreshToken`/`RevokeActiveTokensBySession` 固定 SQL；登录与轮换改为单事务提交；哨兵错误 `ErrInvalidRefreshToken`/`ErrRefreshTokenConsumed` 等，handler 按 `errors.Is` 映射 401/500；存量空 `session_id` 行保留旧登出/新生会话链的兼容路径。
++- Done right：`TestRefreshToken_ConcurrentSameRefresh`（文件库、24 goroutine 并发恰 1 成功，其余全部 consumed）、`TestRefreshToken_ConsumedStateSurvivesRestart`（重开库+新 AuthService 后已消费仍拒绝、链头可继续轮换）、`TestRefreshToken_RollbackKeepsRefreshRetryable`（事务回滚后旧 refresh 仍可轮换）、`TestLogout_SessionIsolationSameUA`（同 UA 两会话登出隔离）均通过，`go test -race` 通过；handler 层验证已消费返回 401 且提示「已被使用」、关库返回 500。
++- Seen 1× (2026-10-14)。状态：经验。
++
+ ## 条目格式
+ 
+ ```text
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 99476a9..449c039 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -279,7 +279,7 @@ func (a *App) Init() error {
+ 	a.songTagService.SetPlayHistoryCleaner(db.PlayHistoryRepository())
+ 
+ 	// 创建认证服务
+-	authService, err := services.NewAuthService(configRepo, db.TokenRepository(), a.config.Username, a.config.Password)
++	authService, err := services.NewAuthService(configRepo, db, db.TokenRepository(), a.config.Username, a.config.Password)
+ 	if err != nil {
+ 		return fmt.Errorf("创建认证服务失败: %w", err)
+ 	}
+diff --git a/internal/database/migrations/0040_auth_token_session.sql b/internal/database/migrations/0040_auth_token_session.sql
+new file mode 100644
+index 0000000..c123414
+--- /dev/null
++++ b/internal/database/migrations/0040_auth_token_session.sql
+@@ -0,0 +1,21 @@
++-- +goose Up
++-- +goose StatementBegin
++-- 会话身份：登录时生成一次，refresh 轮换保持不变；client_info 仅用于展示，
++-- 不能再充当会话键（相同 UA 的独立登录必须是不同会话）。
++ALTER TABLE auth_tokens ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
++-- +goose StatementEnd
++
++-- +goose StatementBegin
++CREATE INDEX idx_auth_tokens_session_id ON auth_tokens(session_id);
++-- +goose StatementEnd
++
++-- +goose Down
++-- +goose StatementBegin
++DROP INDEX IF EXISTS idx_auth_tokens_session_id;
++-- +goose StatementEnd
++
++-- +goose StatementBegin
++-- 必须先删索引再删列：SQLite 不允许 DROP 被索引引用的列。
++-- DROP COLUMN 需要 SQLite 3.35+，modernc.org/sqlite 绑定的版本满足要求。
++ALTER TABLE auth_tokens DROP COLUMN session_id;
++-- +goose StatementEnd
+diff --git a/internal/database/queries/tokens.sql b/internal/database/queries/tokens.sql
+index 0d0971a..f2fcd83 100644
+--- a/internal/database/queries/tokens.sql
++++ b/internal/database/queries/tokens.sql
+@@ -1,11 +1,11 @@
+ -- name: CreateToken :execlastid
+ INSERT INTO auth_tokens (
+-    token_id, token_type, client_info, expires_at, revoked_at,
++    token_id, token_type, client_info, session_id, expires_at, revoked_at,
+     revoked_by, created_at, revoked_reason
+-) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
++) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+ 
+ -- name: GetTokenByID :one
+-SELECT id, token_id, token_type, client_info, expires_at, revoked_at,
++SELECT id, token_id, token_type, client_info, session_id, expires_at, revoked_at,
+     revoked_by, created_at, revoked_reason
+ FROM auth_tokens WHERE token_id = ?;
+ 
+@@ -22,3 +22,32 @@ SELECT EXISTS(
+     SELECT 1 FROM auth_tokens
+     WHERE token_id = ? AND (revoked_at IS NOT NULL OR expires_at < ?)
+ );
++
++-- ConsumeRefreshToken atomically consumes one active refresh token.
++-- The guard conditions make concurrent refreshes race-free: only one
++-- statement can match the still-valid row; every later call matches zero
++-- rows and the caller reports reuse instead of issuing another pair.
++-- name: ConsumeRefreshToken :execrows
++UPDATE auth_tokens
++SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
++WHERE token_id = ?
++  AND token_type = 'refresh'
++  AND revoked_at IS NULL
++  AND expires_at >= ?;
++
++-- name: GetActiveTokenIDsBySession :many
++SELECT token_id FROM auth_tokens
++WHERE session_id = ?
++  AND session_id != ''
++  AND revoked_at IS NULL
++  AND expires_at > ?;
++
++-- RevokeActiveTokensBySession revokes every still-active token of one
++-- session (current access token + refresh chain head). Empty session_id
++-- never matches, so pre-migration rows can't be swept in bulk.
++-- name: RevokeActiveTokensBySession :execrows
++UPDATE auth_tokens
++SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
++WHERE session_id = ?
++  AND session_id != ''
++  AND revoked_at IS NULL;
+diff --git a/internal/database/sqlc/models.go b/internal/database/sqlc/models.go
+index f2cd417..a13ee46 100644
+--- a/internal/database/sqlc/models.go
++++ b/internal/database/sqlc/models.go
+@@ -26,6 +26,7 @@ type AuthToken struct {
+ 	RevokedBy     string
+ 	RevokedReason string
+ 	CreatedAt     time.Time
++	SessionID     string
+ }
+ 
+ type Config struct {
+diff --git a/internal/database/sqlc/querier.go b/internal/database/sqlc/querier.go
+index 2328622..e4fb58b 100644
+--- a/internal/database/sqlc/querier.go
++++ b/internal/database/sqlc/querier.go
+@@ -19,6 +19,7 @@ type Querier interface {
+ 	ClearPlayHistory(ctx context.Context, arg ClearPlayHistoryParams) (int64, error)
+ 	ClearPlayHistoryByPlaylist(ctx context.Context, contextKey string) (int64, error)
+ 	ClearPlayHistoryByTag(ctx context.Context, contextKey string) (int64, error)
++	ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error)
+ 	CountArtistSongs(ctx context.Context, artistID int64) (int64, error)
+ 	CountLocalFingerprints(ctx context.Context) (CountLocalFingerprintsRow, error)
+ 	CountPlayHistory(ctx context.Context, arg CountPlayHistoryParams) (int64, error)
+@@ -50,6 +51,7 @@ type Querier interface {
+ 	FindPlaylistByNameExcludeID(ctx context.Context, arg FindPlaylistByNameExcludeIDParams) (int64, error)
+ 	FindSongByDedupKey(ctx context.Context, arg FindSongByDedupKeyParams) (int64, error)
+ 	FindSongPositionInPlaylist(ctx context.Context, arg FindSongPositionInPlaylistParams) (int64, error)
++	GetActiveTokenIDsBySession(ctx context.Context, arg GetActiveTokenIDsBySessionParams) ([]string, error)
+ 	GetArtistByName(ctx context.Context, name string) (Artist, error)
+ 	GetArtistByNormalizedKey(ctx context.Context, normalizedKey string) (Artist, error)
+ 	GetArtistsBySongID(ctx context.Context, songID int64) ([]GetArtistsBySongIDRow, error)
+@@ -97,6 +99,7 @@ type Querier interface {
+ 	RecordPlay(ctx context.Context, arg RecordPlayParams) error
+ 	RemoveSongFromPlaylist(ctx context.Context, arg RemoveSongFromPlaylistParams) (int64, error)
+ 	ResetFailedFingerprintAttempts(ctx context.Context) error
++	RevokeActiveTokensBySession(ctx context.Context, arg RevokeActiveTokensBySessionParams) (int64, error)
+ 	RevokeToken(ctx context.Context, arg RevokeTokenParams) (int64, error)
+ 	SetConfig(ctx context.Context, arg SetConfigParams) error
+ 	SetPlaylistPinned(ctx context.Context, arg SetPlaylistPinnedParams) (int64, error)
+diff --git a/internal/database/sqlc/tokens.sql.go b/internal/database/sqlc/tokens.sql.go
+index 0bad691..6857c12 100644
+--- a/internal/database/sqlc/tokens.sql.go
++++ b/internal/database/sqlc/tokens.sql.go
+@@ -23,17 +23,49 @@ func (q *Queries) CleanExpiredTokens(ctx context.Context, expiresAt time.Time) (
+ 	return result.RowsAffected()
+ }
+ 
++const consumeRefreshToken = `-- name: ConsumeRefreshToken :execrows
++UPDATE auth_tokens
++SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
++WHERE token_id = ?
++  AND token_type = 'refresh'
++  AND revoked_at IS NULL
++  AND expires_at >= ?
++`
++
++type ConsumeRefreshTokenParams struct {
++	RevokedAt     sql.NullTime
++	RevokedBy     string
++	RevokedReason string
++	TokenID       string
++	ExpiresAt     time.Time
++}
++
++func (q *Queries) ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error) {
++	result, err := q.db.ExecContext(ctx, consumeRefreshToken,
++		arg.RevokedAt,
++		arg.RevokedBy,
++		arg.RevokedReason,
++		arg.TokenID,
++		arg.ExpiresAt,
++	)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected()
++}
++
+ const createToken = `-- name: CreateToken :execlastid
+ INSERT INTO auth_tokens (
+-    token_id, token_type, client_info, expires_at, revoked_at,
++    token_id, token_type, client_info, session_id, expires_at, revoked_at,
+     revoked_by, created_at, revoked_reason
+-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ `
+ 
+ type CreateTokenParams struct {
+ 	TokenID       string
+ 	TokenType     string
+ 	ClientInfo    string
++	SessionID     string
+ 	ExpiresAt     time.Time
+ 	RevokedAt     sql.NullTime
+ 	RevokedBy     string
+@@ -46,6 +78,7 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (int64
+ 		arg.TokenID,
+ 		arg.TokenType,
+ 		arg.ClientInfo,
++		arg.SessionID,
+ 		arg.ExpiresAt,
+ 		arg.RevokedAt,
+ 		arg.RevokedBy,
+@@ -58,8 +91,44 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (int64
+ 	return result.LastInsertId()
+ }
+ 
++const getActiveTokenIDsBySession = `-- name: GetActiveTokenIDsBySession :many
++SELECT token_id FROM auth_tokens
++WHERE session_id = ?
++  AND session_id != ''
++  AND revoked_at IS NULL
++  AND expires_at > ?
++`
++
++type GetActiveTokenIDsBySessionParams struct {
++	SessionID string
++	ExpiresAt time.Time
++}
++
++func (q *Queries) GetActiveTokenIDsBySession(ctx context.Context, arg GetActiveTokenIDsBySessionParams) ([]string, error) {
++	rows, err := q.db.QueryContext(ctx, getActiveTokenIDsBySession, arg.SessionID, arg.ExpiresAt)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var items []string
++	for rows.Next() {
++		var tokenID string
++		if err := rows.Scan(&tokenID); err != nil {
++			return nil, err
++		}
++		items = append(items, tokenID)
++	}
++	if err := rows.Close(); err != nil {
++		return nil, err
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	return items, nil
++}
++
+ const getTokenByID = `-- name: GetTokenByID :one
+-SELECT id, token_id, token_type, client_info, expires_at, revoked_at,
++SELECT id, token_id, token_type, client_info, session_id, expires_at, revoked_at,
+     revoked_by, created_at, revoked_reason
+ FROM auth_tokens WHERE token_id = ?
+ `
+@@ -69,6 +138,7 @@ type GetTokenByIDRow struct {
+ 	TokenID       string
+ 	TokenType     string
+ 	ClientInfo    string
++	SessionID     string
+ 	ExpiresAt     time.Time
+ 	RevokedAt     sql.NullTime
+ 	RevokedBy     string
+@@ -84,6 +154,7 @@ func (q *Queries) GetTokenByID(ctx context.Context, tokenID string) (GetTokenByI
+ 		&i.TokenID,
+ 		&i.TokenType,
+ 		&i.ClientInfo,
++		&i.SessionID,
+ 		&i.ExpiresAt,
+ 		&i.RevokedAt,
+ 		&i.RevokedBy,
+@@ -112,6 +183,34 @@ func (q *Queries) IsTokenRevoked(ctx context.Context, arg IsTokenRevokedParams)
+ 	return exists, err
+ }
+ 
++const revokeActiveTokensBySession = `-- name: RevokeActiveTokensBySession :execrows
++UPDATE auth_tokens
++SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
++WHERE session_id = ?
++  AND session_id != ''
++  AND revoked_at IS NULL
++`
++
++type RevokeActiveTokensBySessionParams struct {
++	RevokedAt     sql.NullTime
++	RevokedBy     string
++	RevokedReason string
++	SessionID     string
++}
++
++func (q *Queries) RevokeActiveTokensBySession(ctx context.Context, arg RevokeActiveTokensBySessionParams) (int64, error) {
++	result, err := q.db.ExecContext(ctx, revokeActiveTokensBySession,
++		arg.RevokedAt,
++		arg.RevokedBy,
++		arg.RevokedReason,
++		arg.SessionID,
++	)
++	if err != nil {
++		return 0, err
++	}
++	return result.RowsAffected()
++}
++
+ const revokeToken = `-- name: RevokeToken :execrows
+ UPDATE auth_tokens
+ SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
+diff --git a/internal/database/sqlite.go b/internal/database/sqlite.go
+index eb357d0..6ef08e3 100644
+--- a/internal/database/sqlite.go
++++ b/internal/database/sqlite.go
+@@ -127,6 +127,7 @@ func (s *SQLiteDB) RunInTx(ctx context.Context, fn func(context.Context, *UnitOf
+ 		PlaylistSongs: NewPlaylistSongRepository(tx),
+ 		PlayHistory:   NewPlayHistoryRepository(tx),
+ 		SongArtists:   NewSongArtistRepository(tx),
++		Tokens:        NewTokenRepository(tx),
+ 	}
+ 	if err := fn(ctx, uow); err != nil {
+ 		_ = tx.Rollback()
+diff --git a/internal/database/token_repository.go b/internal/database/token_repository.go
+index dfc7cc1..10b0987 100644
+--- a/internal/database/token_repository.go
++++ b/internal/database/token_repository.go
+@@ -13,6 +13,10 @@ import (
+ 	"songloft/internal/models"
+ )
+ 
++// RefreshConsumedReason 是 refresh token 被成功轮换消费时写入的撤销原因，
++// 也是复用检测（refresh token reuse）区分「已消费」与普通撤销的依据。
++const RefreshConsumedReason = "token refreshed"
++
+ // TokenRepository 认证令牌仓储。
+ // 固定 SQL 走 sqlc.Queries，动态过滤/排序的 ListActive 走 squirrel。
+ type TokenRepository struct {
+@@ -35,6 +39,7 @@ func (r *TokenRepository) Create(ctx context.Context, token *models.AuthToken) e
+ 		TokenID:       token.TokenID,
+ 		TokenType:     token.TokenType,
+ 		ClientInfo:    token.ClientInfo,
++		SessionID:     token.SessionID,
+ 		ExpiresAt:     token.ExpiresAt,
+ 		RevokedAt:     revokedAt,
+ 		RevokedBy:     token.RevokedBy,
+@@ -57,7 +62,7 @@ func (r *TokenRepository) GetByID(ctx context.Context, tokenID string) (*models.
+ 		}
+ 		return nil, fmt.Errorf("get token: %w", err)
+ 	}
+-	return tokenRowToModel(row.ID, row.TokenID, row.TokenType, row.ClientInfo,
++	return tokenRowToModel(row.ID, row.TokenID, row.TokenType, row.ClientInfo, row.SessionID,
+ 		row.ExpiresAt, row.RevokedAt, row.RevokedBy, row.CreatedAt, row.RevokedReason), nil
+ }
+ 
+@@ -78,12 +83,58 @@ func (r *TokenRepository) Revoke(ctx context.Context, tokenID, revokedBy, reason
+ 	return nil
+ }
+ 
++// ConsumeRefreshToken 原子消费一个仍然有效的 refresh token。
++// 仅当记录存在、类型为 refresh、未撤销且未过期时才会命中一行；
++// 并发轮换时只有一个调用方命中，其余命中 0 行，由调用方按复用处理。
++// 必须在事务内、且在任何读操作之前作为第一条语句执行，
++// 以借助条件 UPDATE 直接抢占写锁，避免读后写竞态。
++func (r *TokenRepository) ConsumeRefreshToken(ctx context.Context, tokenID, revokedBy string, now time.Time) (int64, error) {
++	rows, err := r.queries.ConsumeRefreshToken(ctx, sqlc.ConsumeRefreshTokenParams{
++		RevokedAt:     sql.NullTime{Time: now, Valid: true},
++		RevokedBy:     revokedBy,
++		RevokedReason: RefreshConsumedReason,
++		TokenID:       tokenID,
++		ExpiresAt:     now,
++	})
++	if err != nil {
++		return 0, fmt.Errorf("consume refresh token: %w", err)
++	}
++	return rows, nil
++}
++
++// GetActiveTokenIDsBySession 返回某会话当前仍活跃（未撤销、未过期）的全部令牌 ID。
++func (r *TokenRepository) GetActiveTokenIDsBySession(ctx context.Context, sessionID string) ([]string, error) {
++	ids, err := r.queries.GetActiveTokenIDsBySession(ctx, sqlc.GetActiveTokenIDsBySessionParams{
++		SessionID: sessionID,
++		ExpiresAt: time.Now(),
++	})
++	if err != nil {
++		return nil, fmt.Errorf("get active token ids by session: %w", err)
++	}
++	return ids, nil
++}
++
++// RevokeActiveTokensBySession 撤销某会话所有仍活跃的令牌
++// （当前 access token 与 refresh 链头），返回受影响行数。
++func (r *TokenRepository) RevokeActiveTokensBySession(ctx context.Context, sessionID, revokedBy, reason string, now time.Time) (int64, error) {
++	rows, err := r.queries.RevokeActiveTokensBySession(ctx, sqlc.RevokeActiveTokensBySessionParams{
++		RevokedAt:     sql.NullTime{Time: now, Valid: true},
++		RevokedBy:     revokedBy,
++		RevokedReason: reason,
++		SessionID:     sessionID,
++	})
++	if err != nil {
++		return 0, fmt.Errorf("revoke tokens by session: %w", err)
++	}
++	return rows, nil
++}
++
+ // ListActive 列出未撤销且未过期的令牌，支持按类型筛选 + 白名单排序 + 分页。
+ func (r *TokenRepository) ListActive(ctx context.Context, filter *TokenFilter) ([]*models.AuthToken, error) {
+ 	if filter == nil {
+ 		filter = &TokenFilter{}
+ 	}
+-	sb := sq.Select("id", "token_id", "token_type", "client_info", "expires_at",
++	sb := sq.Select("id", "token_id", "token_type", "client_info", "session_id", "expires_at",
+ 		"revoked_at", "revoked_by", "created_at", "revoked_reason").
+ 		From("auth_tokens").
+ 		Where(sq.Eq{"revoked_at": nil}).
+@@ -112,15 +163,16 @@ func (r *TokenRepository) ListActive(ctx context.Context, filter *TokenFilter) (
+ 		var (
+ 			id                             int64
+ 			tokenID, tokenType, clientInfo string
++			sessionID                      string
+ 			expiresAt, createdAt           time.Time
+ 			revokedAt                      sql.NullTime
+ 			revokedBy, revokedReason       string
+ 		)
+-		if err := rows.Scan(&id, &tokenID, &tokenType, &clientInfo,
++		if err := rows.Scan(&id, &tokenID, &tokenType, &clientInfo, &sessionID,
+ 			&expiresAt, &revokedAt, &revokedBy, &createdAt, &revokedReason); err != nil {
+ 			return nil, fmt.Errorf("scan token: %w", err)
+ 		}
+-		tokens = append(tokens, tokenRowToModel(id, tokenID, tokenType, clientInfo,
++		tokens = append(tokens, tokenRowToModel(id, tokenID, tokenType, clientInfo, sessionID,
+ 			expiresAt, revokedAt, revokedBy, createdAt, revokedReason))
+ 	}
+ 	if err := rows.Err(); err != nil {
+@@ -150,13 +202,14 @@ func (r *TokenRepository) IsRevoked(ctx context.Context, tokenID string) (bool,
+ 	return revoked, nil
+ }
+ 
+-func tokenRowToModel(id int64, tokenID, tokenType, clientInfo string,
++func tokenRowToModel(id int64, tokenID, tokenType, clientInfo, sessionID string,
+ 	expiresAt time.Time, revokedAt sql.NullTime, revokedBy string, createdAt time.Time, revokedReason string) *models.AuthToken {
+ 	t := &models.AuthToken{
+ 		ID:            id,
+ 		TokenID:       tokenID,
+ 		TokenType:     tokenType,
+ 		ClientInfo:    clientInfo,
++		SessionID:     sessionID,
+ 		ExpiresAt:     expiresAt,
+ 		RevokedBy:     revokedBy,
+ 		CreatedAt:     createdAt,
+diff --git a/internal/database/unit_of_work.go b/internal/database/unit_of_work.go
+index e852518..f5926bd 100644
+--- a/internal/database/unit_of_work.go
++++ b/internal/database/unit_of_work.go
+@@ -9,4 +9,5 @@ type UnitOfWork struct {
+ 	PlaylistSongs *PlaylistSongRepository
+ 	PlayHistory   *PlayHistoryRepository
+ 	SongArtists   *SongArtistRepository
++	Tokens        *TokenRepository
+ }
+diff --git a/internal/handlers/auth.go b/internal/handlers/auth.go
+index cd8345a..e1f16b7 100644
+--- a/internal/handlers/auth.go
++++ b/internal/handlers/auth.go
+@@ -2,6 +2,7 @@ package handlers
+ 
+ import (
+ 	"encoding/json"
++	"errors"
+ 	"net/http"
+ 
+ 	"songloft/internal/database"
+@@ -54,7 +55,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+ 	// 执行登录
+ 	resp, err := h.authService.Login(ctx, req.Username, req.Password, clientInfo)
+ 	if err != nil {
+-		respondError(w, http.StatusUnauthorized, "用户名或密码错误", err)
++		// 只有凭证错误才是 401；存储故障等必须是 500，不能伪装成凭证无效。
++		if errors.Is(err, services.ErrInvalidCredentials) {
++			respondError(w, http.StatusUnauthorized, "用户名或密码错误", err)
++			return
++		}
++		respondError(w, http.StatusInternalServerError, "登录失败", err)
+ 		return
+ 	}
+ 
+@@ -125,13 +131,34 @@ func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
+ 	// 执行刷新令牌
+ 	resp, err := h.authService.RefreshToken(ctx, req.RefreshToken, clientInfo)
+ 	if err != nil {
+-		respondError(w, http.StatusUnauthorized, "刷新令牌无效", err)
++		// 凭证类问题（无效/过期/撤销/已消费）返回 401 并给出明确原因；
++		// 数据库等存储故障返回 500，客户端可原样重试。
++		if services.IsRefreshCredentialError(err) {
++			respondError(w, http.StatusUnauthorized, refreshErrorMessage(err), err)
++			return
++		}
++		respondError(w, http.StatusInternalServerError, "刷新令牌失败", err)
+ 		return
+ 	}
+ 
+ 	respondJSON(w, http.StatusOK, resp)
+ }
+ 
++// refreshErrorMessage 把 refresh 凭证类错误映射为明确的中文提示，
++// 复用（已消费）必须让客户端明确知道令牌已被使用而不是笼统的无效。
++func refreshErrorMessage(err error) string {
++	switch {
++	case errors.Is(err, services.ErrRefreshTokenConsumed):
++		return "刷新令牌已被使用，请重新登录"
++	case errors.Is(err, services.ErrRefreshTokenExpired):
++		return "刷新令牌已过期，请重新登录"
++	case errors.Is(err, services.ErrRefreshTokenRevoked):
++		return "刷新令牌已被撤销，请重新登录"
++	default:
++		return "刷新令牌无效"
++	}
++}
++
+ // ListTokens 列出活跃令牌
+ // @Summary 列出活跃令牌
+ // @Description 获取当前用户的所有活跃令牌列表
+diff --git a/internal/handlers/auth_test.go b/internal/handlers/auth_test.go
+index 3ae9188..62ac023 100644
+--- a/internal/handlers/auth_test.go
++++ b/internal/handlers/auth_test.go
+@@ -27,7 +27,7 @@ func newAuthHandlerForTest(t *testing.T) *AuthHandler {
+ 		t.Fatalf("seed jwt_secret: %v", err)
+ 	}
+ 
+-	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb.TokenRepository(), "admin", "password")
++	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "admin", "password")
+ 	if err != nil {
+ 		t.Fatalf("create auth service: %v", err)
+ 	}
+@@ -155,6 +155,75 @@ func TestAuthHandler_RefreshToken(t *testing.T) {
+ 	}
+ }
+ 
++// doRefresh 直接调用 RefreshToken handler 并返回 recorder。
++func doRefresh(handler *AuthHandler, refreshToken string) *httptest.ResponseRecorder {
++	body, _ := json.Marshal(models.RefreshTokenRequest{RefreshToken: refreshToken})
++	req := httptest.NewRequest("POST", "/auth/refresh", bytes.NewBuffer(body))
++	req.Header.Set("Content-Type", "application/json")
++	rr := httptest.NewRecorder()
++	handler.RefreshToken(rr, req)
++	return rr
++}
++
++// TestAuthHandler_RefreshToken_ConsumedRejectedClearly 已被轮换消费的
++// refresh token 必须返回 401，且错误信息明确告知已被使用。
++func TestAuthHandler_RefreshToken_ConsumedRejectedClearly(t *testing.T) {
++	handler := newAuthHandlerForTest(t)
++
++	loginReq := models.LoginRequest{Username: "admin", Password: "password"}
++	loginData, _ := json.Marshal(loginReq)
++	loginRequest := httptest.NewRequest("POST", "/auth/login", bytes.NewBuffer(loginData))
++	loginRequest.Header.Set("Content-Type", "application/json")
++	loginRecorder := httptest.NewRecorder()
++	handler.Login(loginRecorder, loginRequest)
++	var loginResp models.LoginResponse
++	json.Unmarshal(loginRecorder.Body.Bytes(), &loginResp)
++
++	// 第一次轮换成功。
++	if rr := doRefresh(handler, loginResp.RefreshToken); rr.Code != http.StatusOK {
++		t.Fatalf("first refresh = %d, want 200", rr.Code)
++	}
++
++	// 复用旧 refresh：401 且明确提示已被使用。
++	rr := doRefresh(handler, loginResp.RefreshToken)
++	if rr.Code != http.StatusUnauthorized {
++		t.Fatalf("reused refresh status = %d, want 401", rr.Code)
++	}
++	var errResp map[string]string
++	if err := json.Unmarshal(rr.Body.Bytes(), &errResp); err != nil {
++		t.Fatalf("decode error response: %v", err)
++	}
++	if errResp["error"] != "刷新令牌已被使用，请重新登录" {
++		t.Fatalf("unexpected error message: %q", errResp["error"])
++	}
++}
++
++// TestAuthHandler_RefreshToken_StorageFailureReturns500 存储故障必须映射为
++// 500，而不是伪装成 401 凭证无效。
++func TestAuthHandler_RefreshToken_StorageFailureReturns500(t *testing.T) {
++	mdb := testutil.OpenMemoryDB(t)
++	secret, _ := services.GenerateSecret()
++	if err := mdb.ConfigRepository().Set(context.Background(), &models.Config{
++		Key:   "jwt_secret",
++		Value: secret,
++	}); err != nil {
++		t.Fatalf("seed jwt_secret: %v", err)
++	}
++	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "admin", "password")
++	if err != nil {
++		t.Fatalf("create auth service: %v", err)
++	}
++	if err := mdb.Close(); err != nil {
++		t.Fatalf("close db: %v", err)
++	}
++	handler := NewAuthHandler(svc)
++
++	rr := doRefresh(handler, "any-token")
++	if rr.Code != http.StatusInternalServerError {
++		t.Fatalf("storage failure status = %d, want 500", rr.Code)
++	}
++}
++
+ // TestAuthHandler_RefreshToken_InvalidRequest 测试刷新token处理器 - 无效请求
+ func TestAuthHandler_RefreshToken_InvalidRequest(t *testing.T) {
+ 	handler := newAuthHandlerForTest(t)
+diff --git a/internal/middleware/auth_test.go b/internal/middleware/auth_test.go
+index 87ff0b3..847f981 100644
+--- a/internal/middleware/auth_test.go
++++ b/internal/middleware/auth_test.go
+@@ -29,7 +29,7 @@ func newAuthServiceForTest(t *testing.T) *services.AuthService {
+ 		t.Fatalf("seed jwt_secret: %v", err)
+ 	}
+ 
+-	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb.TokenRepository(), "testuser", "testpass")
++	svc, err := services.NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "testuser", "testpass")
+ 	if err != nil {
+ 		t.Fatalf("create auth service: %v", err)
+ 	}
+diff --git a/internal/models/models.go b/internal/models/models.go
+index 944f70e..f516fc9 100644
+--- a/internal/models/models.go
++++ b/internal/models/models.go
+@@ -589,7 +589,9 @@ type AuthToken struct {
+ 	ID            int64     `json:"id" example:"1"`                                         // 记录 ID
+ 	TokenID       string    `json:"token_id" example:"abc123"`                              // 令牌 ID
+ 	TokenType     string    `json:"token_type" example:"access" enums:"access,refresh"`     // 令牌类型
+-	ClientInfo    string    `json:"client_info" example:"Mozilla/5.0 AppleWebKit/605.1.15"` // 客户端信息
++	ClientInfo    string    `json:"client_info" example:"Mozilla/5.0 AppleWebKit/605.1.15"` // 客户端信息（仅展示用）
++	// SessionID 是登录时生成的随机会话身份，轮换期间保持稳定，不对外暴露。
++	SessionID     string    `json:"-"`
+ 	ExpiresAt     time.Time `json:"expires_at" example:"2024-01-08T12:00:00Z"`              // 过期时间
+ 	RevokedAt     time.Time `json:"revoked_at,omitempty" example:"2024-01-01T12:00:00Z"`    // 撤销时间
+ 	RevokedBy     string    `json:"revoked_by,omitempty" example:"user"`                    // 撤销者
+diff --git a/internal/services/auth_refresh_test.go b/internal/services/auth_refresh_test.go
+new file mode 100644
+index 0000000..628df42
+--- /dev/null
++++ b/internal/services/auth_refresh_test.go
+@@ -0,0 +1,430 @@
++package services
++
++import (
++	"context"
++	"encoding/hex"
++	"errors"
++	"path/filepath"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v5"
++
++	"songloft/internal/database"
++	"songloft/internal/database/testutil"
++	"songloft/internal/models"
++)
++
++// parseClientID 解析令牌里的 client_id（会话身份）声明。
++func parseClientID(t *testing.T, secretHex, token string) string {
++	t.Helper()
++	secret, err := hex.DecodeString(secretHex)
++	if err != nil {
++		t.Fatalf("decode secret: %v", err)
++	}
++	claims := &Claims{}
++	if _, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
++		return secret, nil
++	}); err != nil {
++		t.Fatalf("parse token: %v", err)
++	}
++	return claims.ClientID
++}
++
++// newAuthFileEnv 在临时文件库上构造测试环境，用于多连接并发与重启持久化场景。
++func newAuthFileEnv(t *testing.T) (*authTestEnv, string) {
++	t.Helper()
++	secret, _ := GenerateSecret()
++	dbPath := filepath.Join(t.TempDir(), "auth-test.db")
++	mdb, err := database.Open(dbPath)
++	if err != nil {
++		t.Fatalf("open file db: %v", err)
++	}
++	t.Cleanup(func() { _ = mdb.Close() })
++	if err := mdb.ConfigRepository().Set(context.Background(), &models.Config{Key: "jwt_secret", Value: secret}); err != nil {
++		t.Fatalf("seed jwt_secret: %v", err)
++	}
++	svc, err := NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "admin", "password")
++	if err != nil {
++		t.Fatalf("create auth service: %v", err)
++	}
++	t.Cleanup(svc.Close)
++	return &authTestEnv{
++		db:      mdb,
++		configs: mdb.ConfigRepository(),
++		tokens:  mdb.TokenRepository(),
++	}, secret
++}
++
++func serviceFromEnv(env *authTestEnv, t *testing.T) *AuthService {
++	t.Helper()
++	svc, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
++	if err != nil {
++		t.Fatalf("create auth service: %v", err)
++	}
++	t.Cleanup(svc.Close)
++	return svc
++}
++
++// TestRefreshToken_RotationHappyPath 验证无故障轮换流程不变：新对可用，
++// 旧 access 仍然有效（轮换不撤销它），旧 refresh 被明确判为已消费，
++// 会话身份跨连续刷新保持稳定。
++func TestRefreshToken_RotationHappyPath(t *testing.T) {
++	env := newAuthTestEnv(t)
++	secret, _ := GenerateSecret()
++	env.seedJWTSecret(t, secret)
++	svc := serviceFromEnv(env, t)
++
++	ctx := context.Background()
++	login, err := svc.Login(ctx, "admin", "password", "UA/1.0")
++	if err != nil {
++		t.Fatalf("login: %v", err)
++	}
++
++	sid0 := parseClientID(t, secret, login.AccessToken)
++
++	r1, err := svc.RefreshToken(ctx, login.RefreshToken, "UA/1.0")
++	if err != nil {
++		t.Fatalf("first refresh: %v", err)
++	}
++	sid1 := parseClientID(t, secret, r1.AccessToken)
++	if sid1 != sid0 {
++		t.Fatalf("session id changed after refresh: %q -> %q", sid0, sid1)
++	}
++
++	// 新 access / refresh 均有效。
++	if _, err := svc.ValidateToken(ctx, r1.AccessToken); err != nil {
++		t.Fatalf("new access token invalid: %v", err)
++	}
++	r2, err := svc.RefreshToken(ctx, r1.RefreshToken, "UA/2.0")
++	if err != nil {
++		t.Fatalf("second refresh: %v", err)
++	}
++	if sid := parseClientID(t, secret, r2.RefreshToken); sid != sid0 {
++		t.Fatalf("session id not stable on refresh token claim: %q", sid)
++	}
++
++	// 旧 access 在轮换后仍然有效（保持历史行为）。
++	if _, err := svc.ValidateToken(ctx, login.AccessToken); err != nil {
++		t.Fatalf("previous access token should stay valid after rotation: %v", err)
++	}
++
++	// 已消费的旧 refresh（两次）都必须被明确拒绝。
++	for _, used := range []string{login.RefreshToken, r1.RefreshToken} {
++		_, err := svc.RefreshToken(ctx, used, "UA/1.0")
++		if !errors.Is(err, ErrRefreshTokenConsumed) {
++			t.Fatalf("expected ErrRefreshTokenConsumed, got %v", err)
++		}
++	}
++
++	// 最新 refresh 仍可继续轮换。
++	if _, err := svc.RefreshToken(ctx, r2.RefreshToken, "UA/1.0"); err != nil {
++		t.Fatalf("latest refresh should rotate: %v", err)
++	}
++}
++
++// TestRefreshToken_ConcurrentSameRefresh 多个请求携带同一 refresh token
++// 并发刷新时，只允许一个成功，其余全部得到「已消费」，且只有一套新会话有效。
++func TestRefreshToken_ConcurrentSameRefresh(t *testing.T) {
++	env, _ := newAuthFileEnv(t)
++	svc := serviceFromEnv(env, t)
++
++	ctx := context.Background()
++	login, err := svc.Login(ctx, "admin", "password", "UA/1.0")
++	if err != nil {
++		t.Fatalf("login: %v", err)
++	}
++
++	const n = 24
++	start := make(chan struct{})
++	var wg sync.WaitGroup
++	var mu sync.Mutex
++	successes := 0
++	consumed := 0
++	otherErrs := 0
++	var winner string
++
++	wg.Add(n)
++	for i := 0; i < n; i++ {
++		go func() {
++			defer wg.Done()
++			<-start
++			resp, err := svc.RefreshToken(ctx, login.RefreshToken, "UA/1.0")
++			mu.Lock()
++			defer mu.Unlock()
++			switch {
++			case err == nil:
++				successes++
++				winner = resp.RefreshToken
++			case errors.Is(err, ErrRefreshTokenConsumed):
++				consumed++
++			default:
++				otherErrs++
++				t.Errorf("unexpected refresh error: %v", err)
++			}
++		}()
++	}
++	close(start)
++	wg.Wait()
++
++	if successes != 1 {
++		t.Fatalf("want exactly 1 successful refresh, got %d (consumed=%d other=%d)", successes, consumed, otherErrs)
++	}
++	if consumed != n-1 {
++		t.Fatalf("want %d consumed errors, got %d", n-1, consumed)
++	}
++	if otherErrs != 0 {
++		t.Fatalf("want no other errors, got %d", otherErrs)
++	}
++
++	// 赢家的新 refresh 可以继续轮换，旧 refresh 稳定地判为已消费。
++	if _, err := svc.RefreshToken(ctx, winner, "UA/1.0"); err != nil {
++		t.Fatalf("winning refresh chain should continue: %v", err)
++	}
++	if _, err := svc.RefreshToken(ctx, login.RefreshToken, "UA/1.0"); !errors.Is(err, ErrRefreshTokenConsumed) {
++		t.Fatalf("old refresh must stay consumed after race, got %v", err)
++	}
++}
++
++// TestRefreshToken_ConsumedStateSurvivesRestart 消费结论由持久状态决定：
++// 换一个 AuthService（空内存缓存、新进程语义）后，已消费 refresh 仍被拒绝，
++// 新 refresh 仍可完成轮换。
++func TestRefreshToken_ConsumedStateSurvivesRestart(t *testing.T) {
++	dbPath := filepath.Join(t.TempDir(), "auth-restart.db")
++	secret, _ := GenerateSecret()
++
++	openSvc := func(t *testing.T) (*AuthService, *database.SQLiteDB) {
++		t.Helper()
++		mdb, err := database.Open(dbPath)
++		if err != nil {
++			t.Fatalf("open db: %v", err)
++		}
++		if err := mdb.ConfigRepository().Set(context.Background(), &models.Config{Key: "jwt_secret", Value: secret}); err != nil {
++			t.Fatalf("seed secret: %v", err)
++		}
++		svc, err := NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "admin", "password")
++		if err != nil {
++			t.Fatalf("new service: %v", err)
++		}
++		return svc, mdb
++	}
++
++	svc1, mdb1 := openSvc(t)
++	ctx := context.Background()
++	login, err := svc1.Login(ctx, "admin", "password", "UA/1.0")
++	if err != nil {
++		t.Fatalf("login: %v", err)
++	}
++	r1, err := svc1.RefreshToken(ctx, login.RefreshToken, "UA/1.0")
++	if err != nil {
++		t.Fatalf("refresh: %v", err)
++	}
++	svc1.Close()
++	if err := mdb1.Close(); err != nil {
++		t.Fatalf("close db: %v", err)
++	}
++
++	// “重启”：新连接、新服务实例、全新内存缓存。
++	svc2, mdb2 := openSvc(t)
++	defer mdb2.Close()
++	defer svc2.Close()
++
++	if _, err := svc2.RefreshToken(ctx, login.RefreshToken, "UA/1.0"); !errors.Is(err, ErrRefreshTokenConsumed) {
++		t.Fatalf("consumed refresh must stay rejected after restart, got %v", err)
++	}
++	if _, err := svc2.RefreshToken(ctx, r1.RefreshToken, "UA/1.0"); err != nil {
++		t.Fatalf("unconsumed latest refresh should rotate after restart: %v", err)
++	}
++}
++
++// TestRefreshToken_RollbackKeepsRefreshRetryable 事务中途失败时
++// 旧 refresh 的消费随回滚撤销，之后仍能正常完成轮换，不锁死会话。
++func TestRefreshToken_RollbackKeepsRefreshRetryable(t *testing.T) {
++	env := newAuthTestEnv(t)
++	secret, _ := GenerateSecret()
++	env.seedJWTSecret(t, secret)
++	svc := serviceFromEnv(env, t)
++	ctx := context.Background()
++
++	login, err := svc.Login(ctx, "admin", "password", "UA/1.0")
++	if err != nil {
++		t.Fatalf("login: %v", err)
++	}
++
++	boom := errors.New("simulated failure after consume")
++	err = env.db.RunInTx(ctx, func(ctx context.Context, uow *database.UnitOfWork) error {
++		n, err := uow.Tokens.ConsumeRefreshToken(ctx, login.RefreshToken, "test", time.Now())
++		if err != nil {
++			t.Fatalf("consume: %v", err)
++		}
++		if n != 1 {
++			t.Fatalf("want 1 consumed row, got %d", n)
++		}
++		return boom
++	})
++	if !errors.Is(err, boom) {
++		t.Fatalf("want wrapped boom, got %v", err)
++	}
++
++	// 回滚后旧 refresh 未被消费，轮换必须成功。
++	r1, err := svc.RefreshToken(ctx, login.RefreshToken, "UA/1.0")
++	if err != nil {
++		t.Fatalf("refresh should succeed after rolled-back consume: %v", err)
++	}
++	if _, err := svc.ValidateToken(ctx, r1.AccessToken); err != nil {
++		t.Fatalf("new access invalid: %v", err)
++	}
++}
++
++// TestRefreshToken_InvalidTypeExpiredAndUnknown 类型、有效期与存在性校验语义不变。
++func TestRefreshToken_InvalidTypeExpiredAndUnknown(t *testing.T) {
++	env := newAuthTestEnv(t)
++	secret, _ := GenerateSecret()
++	env.seedJWTSecret(t, secret)
++	svc := serviceFromEnv(env, t)
++	ctx := context.Background()
++
++	login, err := svc.Login(ctx, "admin", "password", "UA/1.0")
++	if err != nil {
++		t.Fatalf("login: %v", err)
++	}
++
++	// 拿 access token 当 refresh 用。
++	if _, err := svc.RefreshToken(ctx, login.AccessToken, "UA/1.0"); !errors.Is(err, ErrRefreshTokenWrongType) {
++		t.Fatalf("want wrong type error, got %v", err)
++	}
++
++	// 不存在的 refresh。
++	if _, err := svc.RefreshToken(ctx, "no-such-token", "UA/1.0"); !errors.Is(err, ErrInvalidRefreshToken) {
++		t.Fatalf("want invalid refresh token, got %v", err)
++	}
++
++	// 已过期的 refresh 记录。
++	expired := &models.AuthToken{
++		TokenID:   "expired-refresh-token",
++		TokenType: "refresh",
++		SessionID: "sid-expired",
++		ExpiresAt: time.Now().Add(-time.Hour),
++		CreatedAt: time.Now().Add(-2 * time.Hour),
++	}
++	if err := env.tokens.Create(ctx, expired); err != nil {
++		t.Fatalf("seed expired refresh: %v", err)
++	}
++	if _, err := svc.RefreshToken(ctx, expired.TokenID, "UA/1.0"); !errors.Is(err, ErrRefreshTokenExpired) {
++		t.Fatalf("want expired error, got %v", err)
++	}
++}
++
++// TestLogout_SessionIsolationSameUA 相同 UA 的两个独立登录是不同会话；
++// 登出其一只撤销该会话当前 access 与 refresh 链，另一个会话完全不受影响。
++func TestLogout_SessionIsolationSameUA(t *testing.T) {
++	env, secret := newAuthFileEnv(t)
++	svc := serviceFromEnv(env, t)
++	ctx := context.Background()
++
++	a, err := svc.Login(ctx, "admin", "password", "SAME-UA")
++	if err != nil {
++		t.Fatalf("login a: %v", err)
++	}
++	b, err := svc.Login(ctx, "admin", "password", "SAME-UA")
++	if err != nil {
++		t.Fatalf("login b: %v", err)
++	}
++	sidA := parseClientID(t, secret, a.AccessToken)
++	sidB := parseClientID(t, secret, b.AccessToken)
++	if sidA == sidB {
++		t.Fatal("two independent logins must have different session ids")
++	}
++
++	// A 轮换一次，链上有新旧两条 refresh。
++	ar, err := svc.RefreshToken(ctx, a.RefreshToken, "SAME-UA")
++	if err != nil {
++		t.Fatalf("refresh a: %v", err)
++	}
++
++	// 登出会话 A（按中间件注入的 clientID = JWT 中的会话身份）。
++	if err := svc.Logout(ctx, ar.AccessToken, sidA); err != nil {
++		t.Fatalf("logout a: %v", err)
++	}
++
++	// A 的当前 access、旧 access 与 refresh 链全部失效。
++	if _, err := svc.ValidateToken(ctx, ar.AccessToken); err == nil {
++		t.Error("session A current access must be revoked")
++	}
++	if _, err := svc.ValidateToken(ctx, a.AccessToken); err == nil {
++		t.Error("session A previous access must be revoked")
++	}
++	if _, err := svc.RefreshToken(ctx, ar.RefreshToken, "SAME-UA"); !errors.Is(err, ErrRefreshTokenRevoked) {
++		t.Fatalf("session A refresh chain must be revoked, got %v", err)
++	}
++
++	// 会话 B 的 access 仍有效，refresh 仍能轮换。
++	if _, err := svc.ValidateToken(ctx, b.AccessToken); err != nil {
++		t.Fatalf("session B access must stay valid: %v", err)
++	}
++	br, err := svc.RefreshToken(ctx, b.RefreshToken, "SAME-UA")
++	if err != nil {
++		t.Fatalf("session B refresh must work: %v", err)
++	}
++	if _, err := svc.ValidateToken(ctx, br.AccessToken); err != nil {
++		t.Fatalf("session B new access invalid: %v", err)
++	}
++}
++
++// TestRefreshToken_StorageFailureNotCredential 存储故障不得被归类为凭证错误。
++func TestRefreshToken_StorageFailureNotCredential(t *testing.T) {
++	mdb := testutil.OpenMemoryDB(t)
++	secret, _ := GenerateSecret()
++	if err := mdb.ConfigRepository().Set(context.Background(), &models.Config{Key: "jwt_secret", Value: secret}); err != nil {
++		t.Fatalf("seed secret: %v", err)
++	}
++	svc, err := NewAuthService(mdb.ConfigRepository(), mdb, mdb.TokenRepository(), "admin", "password")
++	if err != nil {
++		t.Fatalf("new service: %v", err)
++	}
++	if err := mdb.Close(); err != nil {
++		t.Fatalf("close: %v", err)
++	}
++
++	_, err = svc.RefreshToken(context.Background(), "whatever", "UA/1.0")
++	if err == nil {
++		t.Fatal("expected error on closed db")
++	}
++	if IsRefreshCredentialError(err) {
++		t.Fatalf("storage failure must not be classified as credential error: %v", err)
++	}
++}
++
++// TestLogin_PersistsAtomicPairAndStableIdentity 登录写入的两条记录共享
++// 同一随机会话身份；相同 UA 的登录相互独立；登录的存储故障不是凭证错误。
++func TestLogin_PersistsAtomicPairAndStableIdentity(t *testing.T) {
++	env := newAuthTestEnv(t)
++	secret, _ := GenerateSecret()
++	env.seedJWTSecret(t, secret)
++	svc := serviceFromEnv(env, t)
++	ctx := context.Background()
++
++	a, err := svc.Login(ctx, "admin", "password", "SAME-UA")
++	if err != nil {
++		t.Fatalf("login a: %v", err)
++	}
++	b, err := svc.Login(ctx, "admin", "password", "SAME-UA")
++	if err != nil {
++		t.Fatalf("login b: %v", err)
++	}
++	if parseClientID(t, secret, a.AccessToken) == parseClientID(t, secret, b.AccessToken) {
++		t.Fatal("same-UA logins must have distinct session ids")
++	}
++
++	rec, err := env.tokens.GetByID(ctx, a.RefreshToken)
++	if err != nil {
++		t.Fatalf("get refresh row: %v", err)
++	}
++	if rec.SessionID != parseClientID(t, secret, a.RefreshToken) {
++		t.Fatal("persisted session id must equal JWT client_id")
++	}
++	if rec.ClientInfo != "SAME-UA" {
++		t.Fatalf("client info stored for display only, got %q", rec.ClientInfo)
++	}
++}
+diff --git a/internal/services/auth_service.go b/internal/services/auth_service.go
+index b7711a8..e9c42ec 100644
+--- a/internal/services/auth_service.go
++++ b/internal/services/auth_service.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"crypto/rand"
+ 	"encoding/hex"
++	"errors"
+ 	"fmt"
+ 	"sync"
+ 	"time"
+@@ -14,6 +15,32 @@ import (
+ 	"songloft/internal/models"
+ )
+ 
++// 认证业务哨兵错误。凭证类错误由 handler 映射为 401；
++// 数据库/存储故障必须原样上抛为 500，不得伪装成凭证无效。
++var (
++	// ErrInvalidCredentials 用户名或密码错误。
++	ErrInvalidCredentials = errors.New("invalid credentials")
++
++	// ErrInvalidRefreshToken 是所有 refresh 凭证类错误的基类，
++	// 具体原因（过期/撤销/已消费/类型错误）都 wrap 它。
++	ErrInvalidRefreshToken = errors.New("invalid refresh token")
++	// ErrRefreshTokenExpired refresh token 已过期。
++	ErrRefreshTokenExpired = fmt.Errorf("%w: refresh token has expired", ErrInvalidRefreshToken)
++	// ErrRefreshTokenRevoked refresh token 已被主动撤销（如登出、令牌管理接口）。
++	ErrRefreshTokenRevoked = fmt.Errorf("%w: refresh token has been revoked", ErrInvalidRefreshToken)
++	// ErrRefreshTokenConsumed refresh token 已被轮换消费；并发刷新中的失败方
++	// 以及进程重启后再次使用旧 token 都必须落到这个错误（refresh token reuse）。
++	ErrRefreshTokenConsumed = fmt.Errorf("%w: refresh token has already been consumed", ErrInvalidRefreshToken)
++	// ErrRefreshTokenWrongType 提交的不是 refresh 类型令牌。
++	ErrRefreshTokenWrongType = fmt.Errorf("%w: token is not a refresh token", ErrInvalidRefreshToken)
++)
++
++// IsRefreshCredentialError 判断错误是否属于 refresh 凭证类错误（对应 HTTP 401），
++// 其余错误（存储故障等）应由调用方按 500 处理。
++func IsRefreshCredentialError(err error) bool {
++	return errors.Is(err, ErrInvalidRefreshToken)
++}
++
+ // TokenRepository 认证令牌仓储接口（AuthService 依赖）。
+ type TokenRepository interface {
+ 	Create(ctx context.Context, token *models.AuthToken) error
+@@ -24,6 +51,12 @@ type TokenRepository interface {
+ 	IsRevoked(ctx context.Context, tokenID string) (bool, error)
+ }
+ 
++// tokenTx 提供令牌写入所需的事务入口。实现方为 *database.SQLiteDB。
++// 旧 refresh 的消费与新令牌对的写入必须在同一个事务里共同提交。
++type tokenTx interface {
++	RunInTx(ctx context.Context, fn func(context.Context, *database.UnitOfWork) error) error
++}
++
+ // TokenCacheEntry Token 缓存条目
+ type TokenCacheEntry struct {
+ 	Claims    *Claims
+@@ -34,6 +67,7 @@ type TokenCacheEntry struct {
+ // AuthService 认证服务
+ type AuthService struct {
+ 	tokens   TokenRepository
++	tx       tokenTx
+ 	secret   []byte
+ 	username string
+ 	password string
+@@ -58,7 +92,7 @@ type RefreshResponse struct {
+ }
+ 
+ // NewAuthService 创建认证服务
+-func NewAuthService(configs ConfigRepository, tokens TokenRepository, username, password string) (*AuthService, error) {
++func NewAuthService(configs ConfigRepository, tx tokenTx, tokens TokenRepository, username, password string) (*AuthService, error) {
+ 	// 从数据库获取 JWT 密钥
+ 	config, err := configs.Get(context.Background(), "jwt_secret")
+ 	if err != nil {
+@@ -73,6 +107,7 @@ func NewAuthService(configs ConfigRepository, tokens TokenRepository, username,
+ 
+ 	s := &AuthService{
+ 		tokens:   tokens,
++		tx:       tx,
+ 		secret:   secret,
+ 		username: username,
+ 		password: password,
+@@ -118,33 +153,35 @@ func (s *AuthService) Login(ctx context.Context, username, password, clientInfo
+ 	}
+ 
+ 	if username != adminUsername || password != adminPassword {
+-		return nil, fmt.Errorf("invalid credentials")
++		return nil, ErrInvalidCredentials
+ 	}
+ 
+-	// 生成客户端 ID
+-	clientID, err := generateClientID()
++	// 生成随机会话身份：一次登录一个会话，后续轮换保持不变。
++	// 仅用于展示的 clientInfo（UA 等）不能充当会话键。
++	sessionID, err := generateSessionID()
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to generate client id: %w", err)
++		return nil, fmt.Errorf("failed to generate session id: %w", err)
+ 	}
+ 
++	now := time.Now()
++
+ 	// 生成 Access Token (7 天过期)
+-	accessToken, accessExp, err := s.generateToken(clientID, "access", 7*24*time.Hour)
++	accessToken, accessExp, err := s.generateToken(sessionID, "access", 7*24*time.Hour)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to generate access token: %w", err)
+ 	}
+ 
+ 	// 生成 Refresh Token (30 天过期)
+-	refreshToken, refreshExp, err := s.generateToken(clientID, "refresh", 30*24*time.Hour)
++	refreshToken, refreshExp, err := s.generateToken(sessionID, "refresh", 30*24*time.Hour)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to generate refresh token: %w", err)
+ 	}
+ 
+-	// 保存 Token 到数据库
+-	now := time.Now()
+ 	accessRecord := &models.AuthToken{
+ 		TokenID:    accessToken,
+ 		TokenType:  "access",
+ 		ClientInfo: clientInfo,
++		SessionID:  sessionID,
+ 		ExpiresAt:  accessExp,
+ 		CreatedAt:  now,
+ 	}
+@@ -153,16 +190,22 @@ func (s *AuthService) Login(ctx context.Context, username, password, clientInfo
+ 		TokenID:    refreshToken,
+ 		TokenType:  "refresh",
+ 		ClientInfo: clientInfo,
++		SessionID:  sessionID,
+ 		ExpiresAt:  refreshExp,
+ 		CreatedAt:  now,
+ 	}
+ 
+-	if err := s.tokens.Create(ctx, accessRecord); err != nil {
+-		return nil, fmt.Errorf("failed to save access token: %w", err)
+-	}
+-
+-	if err := s.tokens.Create(ctx, refreshRecord); err != nil {
+-		return nil, fmt.Errorf("failed to save refresh token: %w", err)
++	// 一对令牌必须原子持久化：任一写入失败整体回滚，不留下孤立令牌。
++	if err := s.tx.RunInTx(ctx, func(ctx context.Context, uow *database.UnitOfWork) error {
++		if err := uow.Tokens.Create(ctx, accessRecord); err != nil {
++			return err
++		}
++		if err := uow.Tokens.Create(ctx, refreshRecord); err != nil {
++			return err
++		}
++		return nil
++	}); err != nil {
++		return nil, fmt.Errorf("failed to persist token pair: %w", err)
+ 	}
+ 
+ 	// 清理过期 Token
+@@ -234,8 +277,47 @@ func (s *AuthService) startCacheCleanup() {
+ 	}
+ }
+ 
+-// Logout 用户登出
++// Logout 用户登出。只撤销当前访问令牌所属会话的当前 access token 与 refresh 链，
++// 不影响其他会话——即使它们的 User-Agent 等客户端描述完全相同。
+ func (s *AuthService) Logout(ctx context.Context, accessToken, clientID string) error {
++	record, err := s.tokens.GetByID(ctx, accessToken)
++	if err != nil {
++		// 与历史行为一致：令牌不存在（如插件系统内存令牌）时报错，由 handler 返回 500。
++		return fmt.Errorf("failed to get access token: %w", err)
++	}
++
++	// 0040 迁移前的存量行没有会话身份，走旧的按 JWT client_id 匹配路径。
++	if record.SessionID == "" {
++		return s.legacyLogout(ctx, accessToken, clientID)
++	}
++
++	// 先在事务内读出本会话仍活跃的令牌 ID，再一次性全部撤销，
++	// 保证「列举」与「撤销」之间不会因并发轮换漏掉链头。
++	var revokedIDs []string
++	if err := s.tx.RunInTx(ctx, func(ctx context.Context, uow *database.UnitOfWork) error {
++		ids, err := uow.Tokens.GetActiveTokenIDsBySession(ctx, record.SessionID)
++		if err != nil {
++			return err
++		}
++		if _, err := uow.Tokens.RevokeActiveTokensBySession(ctx, record.SessionID, clientID, "logout", time.Now()); err != nil {
++			return err
++		}
++		revokedIDs = ids
++		return nil
++	}); err != nil {
++		return fmt.Errorf("failed to revoke session tokens: %w", err)
++	}
++
++	// 提交成功后再清理进程内缓存，避免其他持有该会话令牌的请求继续命中缓存。
++	for _, id := range revokedIDs {
++		s.deleteTokenCache(id)
++	}
++	return nil
++}
++
++// legacyLogout 是 0040 会话列迁移前存量令牌的登出路径，保持原有行为：
++// 显式撤销当前 access token，再按 JWT client_id 匹配并撤销同客户端的 refresh token。
++func (s *AuthService) legacyLogout(ctx context.Context, accessToken, clientID string) error {
+ 	// 撤销 Access Token
+ 	if err := s.tokens.Revoke(ctx, accessToken, clientID, "logout"); err != nil {
+ 		return fmt.Errorf("failed to revoke access token: %w", err)
+@@ -275,85 +357,124 @@ func (s *AuthService) Logout(ctx context.Context, accessToken, clientID string)
+ 	return nil
+ }
+ 
+-// RefreshToken 刷新Token
++// RefreshToken 刷新Token。
++//
++// 并发安全与原子性：事务内第一条语句是带条件的消费 UPDATE
++// （未撤销 + 未过期 + 类型为 refresh 才命中），因此同 refresh token 的多个
++// 并发请求里只有一个能消费成功并拿到新令牌对；命中 0 行的请求会读到持久状态
++// 并得到明确的「已消费」错误。旧 refresh 的消费与新 access/refresh 的写入
++// 在同一事务共同提交：任一步失败（含提交失败）整体回滚，旧 refresh 仍可重试，
++// 也不会留下孤立新令牌。消费结论完全由数据库状态决定，进程重启后依旧成立。
+ func (s *AuthService) RefreshToken(ctx context.Context, refreshToken, clientInfo string) (*RefreshResponse, error) {
+-	// 验证Refresh Token
+-	isRevoked, err := s.tokens.IsRevoked(ctx, refreshToken)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to check token status: %w", err)
+-	}
++	var resp *RefreshResponse
+ 
+-	if isRevoked {
+-		return nil, fmt.Errorf("refresh token has been revoked")
+-	}
++	err := s.tx.RunInTx(ctx, func(ctx context.Context, uow *database.UnitOfWork) error {
++		now := time.Now()
+ 
+-	// 获取Token详情
+-	token, err := s.tokens.GetByID(ctx, refreshToken)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to get token: %w", err)
+-	}
++		// 条件消费必须是事务内第一条语句：直接以写 UPDATE 抢占 SQLite 写锁，
++		// 并发轮换者在 busy_timeout 后重估，最多一个命中。
++		consumed, err := uow.Tokens.ConsumeRefreshToken(ctx, refreshToken, "system", now)
++		if err != nil {
++			return err
++		}
+ 
+-	// 检查Token类型
+-	if token.TokenType != "refresh" {
+-		return nil, fmt.Errorf("invalid token type")
+-	}
++		// 读取持久状态用于生成新对（命中时）或分类失败原因（未命中时）。
++		old, err := uow.Tokens.GetByID(ctx, refreshToken)
++		if err != nil {
++			// 刚消费命中却读不到行属于存储不一致，按存储错误返回而不是凭证无效。
++			if errors.Is(err, database.ErrNotFound) && consumed == 1 {
++				return fmt.Errorf("consumed refresh token is missing after conditional update: %w", err)
++			}
++			if !errors.Is(err, database.ErrNotFound) {
++				return err
++			}
++		}
+ 
+-	// 检查是否过期
+-	if token.ExpiresAt.Before(time.Now()) {
+-		return nil, fmt.Errorf("refresh token has expired")
+-	}
++		if consumed == 0 {
++			return classifyRefreshFailure(old, now)
++		}
+ 
+-	// 撤销旧的 Token 对
+-	if err := s.tokens.Revoke(ctx, refreshToken, "system", "token refreshed"); err != nil {
+-		return nil, fmt.Errorf("failed to revoke refresh token: %w", err)
+-	}
+-	// 清除旧 Token 的缓存
+-	s.deleteTokenCache(refreshToken)
++		// 会话身份跨轮换保持稳定；存量行（session_id 为空）从本次轮换起开启新链。
++		sessionID := old.SessionID
++		if sessionID == "" {
++			sessionID, err = generateSessionID()
++			if err != nil {
++				return fmt.Errorf("failed to generate session id: %w", err)
++			}
++		}
+ 
+-	// 生成新的 Access Token (7 天过期)
+-	newAccessToken, accessExp, err := s.generateToken(token.ClientInfo, "access", 7*24*time.Hour)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to generate new access token: %w", err)
+-	}
++		// 生成新的 Access Token (7 天过期)
++		newAccessToken, accessExp, err := s.generateToken(sessionID, "access", 7*24*time.Hour)
++		if err != nil {
++			return fmt.Errorf("failed to generate new access token: %w", err)
++		}
+ 
+-	// 生成新的 Refresh Token (30 天过期)
+-	newRefreshToken, refreshExp, err := s.generateToken(token.ClientInfo, "refresh", 30*24*time.Hour)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to generate new refresh token: %w", err)
+-	}
++		// 生成新的 Refresh Token (30 天过期)
++		newRefreshToken, refreshExp, err := s.generateToken(sessionID, "refresh", 30*24*time.Hour)
++		if err != nil {
++			return fmt.Errorf("failed to generate new refresh token: %w", err)
++		}
+ 
+-	// 保存新 Token 到数据库
+-	now := time.Now()
+-	accessRecord := &models.AuthToken{
+-		TokenID:    newAccessToken,
+-		TokenType:  "access",
+-		ClientInfo: clientInfo,
+-		ExpiresAt:  accessExp,
+-		CreatedAt:  now,
+-	}
++		// clientInfo 只写入展示字段，不参与会话身份判定。
++		accessRecord := &models.AuthToken{
++			TokenID:    newAccessToken,
++			TokenType:  "access",
++			ClientInfo: clientInfo,
++			SessionID:  sessionID,
++			ExpiresAt:  accessExp,
++			CreatedAt:  now,
++		}
++		refreshRecord := &models.AuthToken{
++			TokenID:    newRefreshToken,
++			TokenType:  "refresh",
++			ClientInfo: clientInfo,
++			SessionID:  sessionID,
++			ExpiresAt:  refreshExp,
++			CreatedAt:  now,
++		}
+ 
+-	refreshRecord := &models.AuthToken{
+-		TokenID:    newRefreshToken,
+-		TokenType:  "refresh",
+-		ClientInfo: clientInfo,
+-		ExpiresAt:  refreshExp,
+-		CreatedAt:  now,
+-	}
++		if err := uow.Tokens.Create(ctx, accessRecord); err != nil {
++			return err
++		}
++		if err := uow.Tokens.Create(ctx, refreshRecord); err != nil {
++			return err
++		}
+ 
+-	if err := s.tokens.Create(ctx, accessRecord); err != nil {
+-		return nil, fmt.Errorf("failed to save new access token: %w", err)
++		resp = &RefreshResponse{
++			AccessToken:  newAccessToken,
++			RefreshToken: newRefreshToken,
++			ExpiresIn:    int64(accessExp.Sub(now).Seconds()),
++			TokenType:    "Bearer",
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
+ 	}
+ 
+-	if err := s.tokens.Create(ctx, refreshRecord); err != nil {
+-		return nil, fmt.Errorf("failed to save new refresh token: %w", err)
+-	}
++	// 提交成功后清理旧 refresh 的进程内缓存。
++	s.deleteTokenCache(refreshToken)
+ 
+-	return &RefreshResponse{
+-		AccessToken:  newAccessToken,
+-		RefreshToken: newRefreshToken,
+-		ExpiresIn:    int64(accessExp.Sub(now).Seconds()),
+-		TokenType:    "Bearer",
+-	}, nil
++	return resp, nil
++}
++
++// classifyRefreshFailure 在条件消费命中 0 行时，依据持久状态给出明确的凭证错误。
++// 任何无法归类的异常状态都返回普通错误（500），而不是伪装成凭证无效。
++func classifyRefreshFailure(old *models.AuthToken, now time.Time) error {
++	switch {
++	case old == nil:
++		return fmt.Errorf("%w: refresh token not found", ErrInvalidRefreshToken)
++	case old.TokenType != "refresh":
++		return ErrRefreshTokenWrongType
++	case !old.ExpiresAt.After(now):
++		return ErrRefreshTokenExpired
++	case old.RevokedReason == database.RefreshConsumedReason:
++		return ErrRefreshTokenConsumed
++	case !old.RevokedAt.IsZero():
++		return ErrRefreshTokenRevoked
++	default:
++		return fmt.Errorf("refresh token consume matched no rows in an unexpected state")
++	}
+ }
+ 
+ // ValidateToken 验证 Token
+@@ -487,8 +608,8 @@ func (s *AuthService) generateToken(clientID, tokenType string, expiresIn time.D
+ 	return tokenString, expirationTime, nil
+ }
+ 
+-// generateClientID 生成客户端ID
+-func generateClientID() (string, error) {
++// generateSessionID 生成随机会话身份 ID
++func generateSessionID() (string, error) {
+ 	return generateRandomString(16)
+ }
+ 
+diff --git a/internal/services/auth_service_test.go b/internal/services/auth_service_test.go
+index 85d48af..7c5472c 100644
+--- a/internal/services/auth_service_test.go
++++ b/internal/services/auth_service_test.go
+@@ -9,8 +9,9 @@ import (
+ 	"songloft/internal/models"
+ )
+ 
+-// authTestEnv 把 :memory: SQLite 下 auth 测试需要的两个仓储打包好。
++// authTestEnv 把 :memory: SQLite 下 auth 测试需要的库与两个仓储打包好。
+ type authTestEnv struct {
++	db      *database.SQLiteDB
+ 	configs *database.ConfigRepository
+ 	tokens  *database.TokenRepository
+ }
+@@ -19,6 +20,7 @@ func newAuthTestEnv(t *testing.T) *authTestEnv {
+ 	t.Helper()
+ 	mdb := testutil.OpenMemoryDB(t)
+ 	return &authTestEnv{
++		db:      mdb,
+ 		configs: mdb.ConfigRepository(),
+ 		tokens:  mdb.TokenRepository(),
+ 	}
+@@ -36,7 +38,7 @@ func TestNewAuthService(t *testing.T) {
+ 	env := newAuthTestEnv(t)
+ 	env.seedJWTSecret(t, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+ 
+-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
++	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
+ 	if err != nil {
+ 		t.Fatalf("Failed to create auth service: %v", err)
+ 	}
+@@ -68,7 +70,7 @@ func TestAuthService_Login(t *testing.T) {
+ 	secret, _ := GenerateSecret()
+ 	env.seedJWTSecret(t, secret)
+ 
+-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
++	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
+ 	if err != nil {
+ 		t.Fatalf("Failed to create auth service: %v", err)
+ 	}
+@@ -102,7 +104,7 @@ func TestAuthService_Logout(t *testing.T) {
+ 	secret, _ := GenerateSecret()
+ 	env.seedJWTSecret(t, secret)
+ 
+-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
++	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
+ 	if err != nil {
+ 		t.Fatalf("Failed to create auth service: %v", err)
+ 	}
+@@ -129,7 +131,7 @@ func TestAuthService_ValidateToken(t *testing.T) {
+ 	secret, _ := GenerateSecret()
+ 	env.seedJWTSecret(t, secret)
+ 
+-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
++	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
+ 	if err != nil {
+ 		t.Fatalf("Failed to create auth service: %v", err)
+ 	}

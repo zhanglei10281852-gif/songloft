@@ -1,0 +1,10 @@
+项目：songloft-org-songloft-b4a44568-4e2a-41e1-8332-f365b134c259
+Session：6acf8e7ba45e75039f9bc523｜Trae 98 轮｜时长 4827 秒｜结论：完成｜不收录
+Rubric ID：1｜状态：通过｜期望行为：正常刷新会返回一套完整的新 access 和 refresh token，旧 refresh 在提交后立即且持续被拒绝，响应字段和有效期语义正确。｜实际观察：消费、两条新记录和响应组装在同一事务，提交后删除旧 refresh 缓存｜直接证据：internal/services/auth_service.go:368-458；refresh 定向测试通过
+Rubric ID：2｜状态：通过｜期望行为：同一 refresh token 的并发请求中恰好一个成功，只产生一套持久且活动的后继令牌，其他请求得到已消费类结果。｜实际观察：事务第一条写是带未撤销、未过期和 refresh 类型条件的 UPDATE，后续请求命中零行并得到 consumed 错误｜直接证据：internal/services/auth_service.go:371-395；internal/database/queries/tokens.sql:26-36；并发测试 -race -count=3 通过
+Rubric ID：3｜状态：通过｜期望行为：在旧令牌消费、新 access 写入、新 refresh 写入或事务提交处注入失败时整体回滚，不留下孤立记录，未提交的旧 refresh 仍可重试。｜实际观察：四阶段均由 RunInTx 包围，任一错误直接返回且缓存只在提交成功后清除｜直接证据：internal/services/auth_service.go:371-456；故障注入定向测试通过
+Rubric ID：4｜状态：通过｜期望行为：随机会话身份在多次刷新后保持不变，客户端描述信息不被当成会话标识，相同 User-Agent 的两次独立登录始终隔离。｜实际观察：登录生成随机 sessionID，刷新继承旧 sessionID，clientInfo 仅写展示字段｜直接证据：internal/services/auth_service.go:161-193,397-433；会话隔离测试通过
+Rubric ID：5｜状态：通过｜期望行为：登出一个会话会撤销该会话当前的 access token 和 refresh 链，但不会撤销相同 User-Agent 下另一次登录的令牌。｜实际观察：事务按非空 session_id 列出并撤销活动令牌，未按 User-Agent 匹配新会话｜直接证据：internal/services/auth_service.go:280-315；internal/database/queries/tokens.sql:38-53；登出隔离测试通过
+Rubric ID：6｜状态：通过｜期望行为：重建 AuthService 或重启进程后，已提交消费的 refresh 仍被拒绝，回滚事务中的 refresh 仍可用，缓存与数据库状态一致。｜实际观察：消费状态持久化在 auth_tokens，失败事务回滚，缓存清理发生在提交后｜直接证据：internal/services/auth_service.go:360-458；重建服务与回滚测试通过
+Rubric ID：7｜状态：通过｜期望行为：普通登录与单次刷新、access 和 refresh 类型校验、既有响应结构和有效期、令牌列表撤销接口及插件系统令牌行为保持兼容。｜实际观察：普通登录与响应结构保持，access/refresh 分类错误明确，plugin-system 继续跳过数据库撤销检查｜直接证据：internal/services/auth_service.go:463-518；services、database、handler 定向测试及 go vet 通过
+关键验证：认证 services、database、并发 refresh race 与 go vet 全部通过；handlers 的四个音频测试失败在固定基线逐项相同，认证改动未新增失败

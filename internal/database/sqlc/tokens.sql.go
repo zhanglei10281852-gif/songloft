@@ -23,17 +23,49 @@ func (q *Queries) CleanExpiredTokens(ctx context.Context, expiresAt time.Time) (
 	return result.RowsAffected()
 }
 
+const consumeRefreshToken = `-- name: ConsumeRefreshToken :execrows
+UPDATE auth_tokens
+SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
+WHERE token_id = ?
+  AND token_type = 'refresh'
+  AND revoked_at IS NULL
+  AND expires_at >= ?
+`
+
+type ConsumeRefreshTokenParams struct {
+	RevokedAt     sql.NullTime
+	RevokedBy     string
+	RevokedReason string
+	TokenID       string
+	ExpiresAt     time.Time
+}
+
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, consumeRefreshToken,
+		arg.RevokedAt,
+		arg.RevokedBy,
+		arg.RevokedReason,
+		arg.TokenID,
+		arg.ExpiresAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const createToken = `-- name: CreateToken :execlastid
 INSERT INTO auth_tokens (
-    token_id, token_type, client_info, expires_at, revoked_at,
+    token_id, token_type, client_info, session_id, expires_at, revoked_at,
     revoked_by, created_at, revoked_reason
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 type CreateTokenParams struct {
 	TokenID       string
 	TokenType     string
 	ClientInfo    string
+	SessionID     string
 	ExpiresAt     time.Time
 	RevokedAt     sql.NullTime
 	RevokedBy     string
@@ -46,6 +78,7 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (int64
 		arg.TokenID,
 		arg.TokenType,
 		arg.ClientInfo,
+		arg.SessionID,
 		arg.ExpiresAt,
 		arg.RevokedAt,
 		arg.RevokedBy,
@@ -58,8 +91,44 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (int64
 	return result.LastInsertId()
 }
 
+const getActiveTokenIDsBySession = `-- name: GetActiveTokenIDsBySession :many
+SELECT token_id FROM auth_tokens
+WHERE session_id = ?
+  AND session_id != ''
+  AND revoked_at IS NULL
+  AND expires_at > ?
+`
+
+type GetActiveTokenIDsBySessionParams struct {
+	SessionID string
+	ExpiresAt time.Time
+}
+
+func (q *Queries) GetActiveTokenIDsBySession(ctx context.Context, arg GetActiveTokenIDsBySessionParams) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, getActiveTokenIDsBySession, arg.SessionID, arg.ExpiresAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var tokenID string
+		if err := rows.Scan(&tokenID); err != nil {
+			return nil, err
+		}
+		items = append(items, tokenID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getTokenByID = `-- name: GetTokenByID :one
-SELECT id, token_id, token_type, client_info, expires_at, revoked_at,
+SELECT id, token_id, token_type, client_info, session_id, expires_at, revoked_at,
     revoked_by, created_at, revoked_reason
 FROM auth_tokens WHERE token_id = ?
 `
@@ -69,6 +138,7 @@ type GetTokenByIDRow struct {
 	TokenID       string
 	TokenType     string
 	ClientInfo    string
+	SessionID     string
 	ExpiresAt     time.Time
 	RevokedAt     sql.NullTime
 	RevokedBy     string
@@ -84,6 +154,7 @@ func (q *Queries) GetTokenByID(ctx context.Context, tokenID string) (GetTokenByI
 		&i.TokenID,
 		&i.TokenType,
 		&i.ClientInfo,
+		&i.SessionID,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
@@ -110,6 +181,34 @@ func (q *Queries) IsTokenRevoked(ctx context.Context, arg IsTokenRevokedParams) 
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const revokeActiveTokensBySession = `-- name: RevokeActiveTokensBySession :execrows
+UPDATE auth_tokens
+SET revoked_at = ?, revoked_by = ?, revoked_reason = ?
+WHERE session_id = ?
+  AND session_id != ''
+  AND revoked_at IS NULL
+`
+
+type RevokeActiveTokensBySessionParams struct {
+	RevokedAt     sql.NullTime
+	RevokedBy     string
+	RevokedReason string
+	SessionID     string
+}
+
+func (q *Queries) RevokeActiveTokensBySession(ctx context.Context, arg RevokeActiveTokensBySessionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, revokeActiveTokensBySession,
+		arg.RevokedAt,
+		arg.RevokedBy,
+		arg.RevokedReason,
+		arg.SessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const revokeToken = `-- name: RevokeToken :execrows

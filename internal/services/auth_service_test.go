@@ -9,8 +9,9 @@ import (
 	"songloft/internal/models"
 )
 
-// authTestEnv 把 :memory: SQLite 下 auth 测试需要的两个仓储打包好。
+// authTestEnv 把 :memory: SQLite 下 auth 测试需要的库与两个仓储打包好。
 type authTestEnv struct {
+	db      *database.SQLiteDB
 	configs *database.ConfigRepository
 	tokens  *database.TokenRepository
 }
@@ -19,6 +20,7 @@ func newAuthTestEnv(t *testing.T) *authTestEnv {
 	t.Helper()
 	mdb := testutil.OpenMemoryDB(t)
 	return &authTestEnv{
+		db:      mdb,
 		configs: mdb.ConfigRepository(),
 		tokens:  mdb.TokenRepository(),
 	}
@@ -36,7 +38,7 @@ func TestNewAuthService(t *testing.T) {
 	env := newAuthTestEnv(t)
 	env.seedJWTSecret(t, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 
-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
+	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
 	if err != nil {
 		t.Fatalf("Failed to create auth service: %v", err)
 	}
@@ -68,7 +70,7 @@ func TestAuthService_Login(t *testing.T) {
 	secret, _ := GenerateSecret()
 	env.seedJWTSecret(t, secret)
 
-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
+	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
 	if err != nil {
 		t.Fatalf("Failed to create auth service: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestAuthService_Logout(t *testing.T) {
 	secret, _ := GenerateSecret()
 	env.seedJWTSecret(t, secret)
 
-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
+	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
 	if err != nil {
 		t.Fatalf("Failed to create auth service: %v", err)
 	}
@@ -129,7 +131,7 @@ func TestAuthService_ValidateToken(t *testing.T) {
 	secret, _ := GenerateSecret()
 	env.seedJWTSecret(t, secret)
 
-	service, err := NewAuthService(env.configs, env.tokens, "admin", "password")
+	service, err := NewAuthService(env.configs, env.db, env.tokens, "admin", "password")
 	if err != nil {
 		t.Fatalf("Failed to create auth service: %v", err)
 	}

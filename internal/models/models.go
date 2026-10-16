@@ -589,7 +589,9 @@ type AuthToken struct {
 	ID            int64     `json:"id" example:"1"`                                         // 记录 ID
 	TokenID       string    `json:"token_id" example:"abc123"`                              // 令牌 ID
 	TokenType     string    `json:"token_type" example:"access" enums:"access,refresh"`     // 令牌类型
-	ClientInfo    string    `json:"client_info" example:"Mozilla/5.0 AppleWebKit/605.1.15"` // 客户端信息
+	ClientInfo    string    `json:"client_info" example:"Mozilla/5.0 AppleWebKit/605.1.15"` // 客户端信息（仅展示用）
+	// SessionID 是登录时生成的随机会话身份，轮换期间保持稳定，不对外暴露。
+	SessionID     string    `json:"-"`
 	ExpiresAt     time.Time `json:"expires_at" example:"2024-01-08T12:00:00Z"`              // 过期时间
 	RevokedAt     time.Time `json:"revoked_at,omitempty" example:"2024-01-01T12:00:00Z"`    // 撤销时间
 	RevokedBy     string    `json:"revoked_by,omitempty" example:"user"`                    // 撤销者

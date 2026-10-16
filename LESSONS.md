@@ -27,6 +27,15 @@
 - Done right：保留首轮失败、实际 SHA 与重跑结果；若修复生命周期，验证关闭返回后不再写缓存，再清理临时目录，不把单次重跑当成修复证明。
 - Seen 1× (2026-10-14)。状态：经验，生命周期修复待处理。
 
+### AUTH-001：refresh token 轮换必须事务内条件消费，会话身份与展示信息分离
+
+- 范围：主仓库认证模块（`internal/services/auth_service.go`、`internal/database` 的 `auth_tokens`）。
+- 规则：① 并发安全不能靠「先 `IsRevoked` 再 `Revoke`」的检查-执行序列，必须在 `RunInTx` 内把带守卫（`token_type='refresh' AND revoked_at IS NULL AND expires_at >= ?`）的条件 UPDATE 作为**第一条语句**原子消费，命中 0 行即复用/失效，再读持久状态分类为「已消费/已撤销/已过期/类型错误」；② 旧 refresh 消费与新 access/refresh 写入同一事务共同提交，任何失败整体回滚，未提交的旧 refresh 必须保持可重试；③ 会话身份是登录时生成、持久化并跨轮换稳定的独立列（`session_id`），User-Agent 等 `client_info` 只用于展示，绝不能充当会话键（相同 UA 的独立登录必须是不同会话，登出按会话撤销）；④ 用哨兵错误区分凭证无效（401）与存储故障（500），DB 错误不得被映射成凭证错误。
+- 失败：2026-10-14，基线 `6b050ff` 的 `RefreshToken` 为 IsRevoked→Get→Revoke→两次 Create 的非事务序列：同一 refresh 并发刷新可各自通过检查并生成多套仍有效的令牌；Create 失败时旧 refresh 已撤销而新令牌缺失，会话被锁死；刷新后新 JWT 的 `client_id` 被写成旧行的 `client_info`（UA），导致相同 UA 的两个独立会话在登出时按 UA 匹配而互相撤销 refresh。
+- 修复：未提交工作树（基线 `6b050ff`）。迁移 `0040_auth_token_session.sql` 增加 `session_id`；`ConsumeRefreshToken`/`RevokeActiveTokensBySession` 固定 SQL；登录与轮换改为单事务提交；哨兵错误 `ErrInvalidRefreshToken`/`ErrRefreshTokenConsumed` 等，handler 按 `errors.Is` 映射 401/500；存量空 `session_id` 行保留旧登出/新生会话链的兼容路径。
+- Done right：`TestRefreshToken_ConcurrentSameRefresh`（文件库、24 goroutine 并发恰 1 成功，其余全部 consumed）、`TestRefreshToken_ConsumedStateSurvivesRestart`（重开库+新 AuthService 后已消费仍拒绝、链头可继续轮换）、`TestRefreshToken_RollbackKeepsRefreshRetryable`（事务回滚后旧 refresh 仍可轮换）、`TestLogout_SessionIsolationSameUA`（同 UA 两会话登出隔离）均通过，`go test -race` 通过；handler 层验证已消费返回 401 且提示「已被使用」、关库返回 500。
+- Seen 1× (2026-10-14)。状态：经验。
+
 ## 条目格式
 
 ```text

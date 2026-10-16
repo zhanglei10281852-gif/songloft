@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"songloft/internal/database"
@@ -54,7 +55,12 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// 执行登录
 	resp, err := h.authService.Login(ctx, req.Username, req.Password, clientInfo)
 	if err != nil {
-		respondError(w, http.StatusUnauthorized, "用户名或密码错误", err)
+		// 只有凭证错误才是 401；存储故障等必须是 500，不能伪装成凭证无效。
+		if errors.Is(err, services.ErrInvalidCredentials) {
+			respondError(w, http.StatusUnauthorized, "用户名或密码错误", err)
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "登录失败", err)
 		return
 	}
 
@@ -125,11 +131,32 @@ func (h *AuthHandler) RefreshToken(w http.ResponseWriter, r *http.Request) {
 	// 执行刷新令牌
 	resp, err := h.authService.RefreshToken(ctx, req.RefreshToken, clientInfo)
 	if err != nil {
-		respondError(w, http.StatusUnauthorized, "刷新令牌无效", err)
+		// 凭证类问题（无效/过期/撤销/已消费）返回 401 并给出明确原因；
+		// 数据库等存储故障返回 500，客户端可原样重试。
+		if services.IsRefreshCredentialError(err) {
+			respondError(w, http.StatusUnauthorized, refreshErrorMessage(err), err)
+			return
+		}
+		respondError(w, http.StatusInternalServerError, "刷新令牌失败", err)
 		return
 	}
 
 	respondJSON(w, http.StatusOK, resp)
+}
+
+// refreshErrorMessage 把 refresh 凭证类错误映射为明确的中文提示，
+// 复用（已消费）必须让客户端明确知道令牌已被使用而不是笼统的无效。
+func refreshErrorMessage(err error) string {
+	switch {
+	case errors.Is(err, services.ErrRefreshTokenConsumed):
+		return "刷新令牌已被使用，请重新登录"
+	case errors.Is(err, services.ErrRefreshTokenExpired):
+		return "刷新令牌已过期，请重新登录"
+	case errors.Is(err, services.ErrRefreshTokenRevoked):
+		return "刷新令牌已被撤销，请重新登录"
+	default:
+		return "刷新令牌无效"
+	}
 }
 
 // ListTokens 列出活跃令牌

@@ -26,6 +26,7 @@ type AuthToken struct {
 	RevokedBy     string
 	RevokedReason string
 	CreatedAt     time.Time
+	SessionID     string
 }
 
 type Config struct {

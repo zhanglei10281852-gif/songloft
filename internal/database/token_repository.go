@@ -13,6 +13,10 @@ import (
 	"songloft/internal/models"
 )
 
+// RefreshConsumedReason 是 refresh token 被成功轮换消费时写入的撤销原因，
+// 也是复用检测（refresh token reuse）区分「已消费」与普通撤销的依据。
+const RefreshConsumedReason = "token refreshed"
+
 // TokenRepository 认证令牌仓储。
 // 固定 SQL 走 sqlc.Queries，动态过滤/排序的 ListActive 走 squirrel。
 type TokenRepository struct {
@@ -35,6 +39,7 @@ func (r *TokenRepository) Create(ctx context.Context, token *models.AuthToken) e
 		TokenID:       token.TokenID,
 		TokenType:     token.TokenType,
 		ClientInfo:    token.ClientInfo,
+		SessionID:     token.SessionID,
 		ExpiresAt:     token.ExpiresAt,
 		RevokedAt:     revokedAt,
 		RevokedBy:     token.RevokedBy,
@@ -57,7 +62,7 @@ func (r *TokenRepository) GetByID(ctx context.Context, tokenID string) (*models.
 		}
 		return nil, fmt.Errorf("get token: %w", err)
 	}
-	return tokenRowToModel(row.ID, row.TokenID, row.TokenType, row.ClientInfo,
+	return tokenRowToModel(row.ID, row.TokenID, row.TokenType, row.ClientInfo, row.SessionID,
 		row.ExpiresAt, row.RevokedAt, row.RevokedBy, row.CreatedAt, row.RevokedReason), nil
 }
 
@@ -78,12 +83,58 @@ func (r *TokenRepository) Revoke(ctx context.Context, tokenID, revokedBy, reason
 	return nil
 }
 
+// ConsumeRefreshToken 原子消费一个仍然有效的 refresh token。
+// 仅当记录存在、类型为 refresh、未撤销且未过期时才会命中一行；
+// 并发轮换时只有一个调用方命中，其余命中 0 行，由调用方按复用处理。
+// 必须在事务内、且在任何读操作之前作为第一条语句执行，
+// 以借助条件 UPDATE 直接抢占写锁，避免读后写竞态。
+func (r *TokenRepository) ConsumeRefreshToken(ctx context.Context, tokenID, revokedBy string, now time.Time) (int64, error) {
+	rows, err := r.queries.ConsumeRefreshToken(ctx, sqlc.ConsumeRefreshTokenParams{
+		RevokedAt:     sql.NullTime{Time: now, Valid: true},
+		RevokedBy:     revokedBy,
+		RevokedReason: RefreshConsumedReason,
+		TokenID:       tokenID,
+		ExpiresAt:     now,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("consume refresh token: %w", err)
+	}
+	return rows, nil
+}
+
+// GetActiveTokenIDsBySession 返回某会话当前仍活跃（未撤销、未过期）的全部令牌 ID。
+func (r *TokenRepository) GetActiveTokenIDsBySession(ctx context.Context, sessionID string) ([]string, error) {
+	ids, err := r.queries.GetActiveTokenIDsBySession(ctx, sqlc.GetActiveTokenIDsBySessionParams{
+		SessionID: sessionID,
+		ExpiresAt: time.Now(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get active token ids by session: %w", err)
+	}
+	return ids, nil
+}
+
+// RevokeActiveTokensBySession 撤销某会话所有仍活跃的令牌
+// （当前 access token 与 refresh 链头），返回受影响行数。
+func (r *TokenRepository) RevokeActiveTokensBySession(ctx context.Context, sessionID, revokedBy, reason string, now time.Time) (int64, error) {
+	rows, err := r.queries.RevokeActiveTokensBySession(ctx, sqlc.RevokeActiveTokensBySessionParams{
+		RevokedAt:     sql.NullTime{Time: now, Valid: true},
+		RevokedBy:     revokedBy,
+		RevokedReason: reason,
+		SessionID:     sessionID,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("revoke tokens by session: %w", err)
+	}
+	return rows, nil
+}
+
 // ListActive 列出未撤销且未过期的令牌，支持按类型筛选 + 白名单排序 + 分页。
 func (r *TokenRepository) ListActive(ctx context.Context, filter *TokenFilter) ([]*models.AuthToken, error) {
 	if filter == nil {
 		filter = &TokenFilter{}
 	}
-	sb := sq.Select("id", "token_id", "token_type", "client_info", "expires_at",
+	sb := sq.Select("id", "token_id", "token_type", "client_info", "session_id", "expires_at",
 		"revoked_at", "revoked_by", "created_at", "revoked_reason").
 		From("auth_tokens").
 		Where(sq.Eq{"revoked_at": nil}).
@@ -112,15 +163,16 @@ func (r *TokenRepository) ListActive(ctx context.Context, filter *TokenFilter) (
 		var (
 			id                             int64
 			tokenID, tokenType, clientInfo string
+			sessionID                      string
 			expiresAt, createdAt           time.Time
 			revokedAt                      sql.NullTime
 			revokedBy, revokedReason       string
 		)
-		if err := rows.Scan(&id, &tokenID, &tokenType, &clientInfo,
+		if err := rows.Scan(&id, &tokenID, &tokenType, &clientInfo, &sessionID,
 			&expiresAt, &revokedAt, &revokedBy, &createdAt, &revokedReason); err != nil {
 			return nil, fmt.Errorf("scan token: %w", err)
 		}
-		tokens = append(tokens, tokenRowToModel(id, tokenID, tokenType, clientInfo,
+		tokens = append(tokens, tokenRowToModel(id, tokenID, tokenType, clientInfo, sessionID,
 			expiresAt, revokedAt, revokedBy, createdAt, revokedReason))
 	}
 	if err := rows.Err(); err != nil {
@@ -150,13 +202,14 @@ func (r *TokenRepository) IsRevoked(ctx context.Context, tokenID string) (bool, 
 	return revoked, nil
 }
 
-func tokenRowToModel(id int64, tokenID, tokenType, clientInfo string,
+func tokenRowToModel(id int64, tokenID, tokenType, clientInfo, sessionID string,
 	expiresAt time.Time, revokedAt sql.NullTime, revokedBy string, createdAt time.Time, revokedReason string) *models.AuthToken {
 	t := &models.AuthToken{
 		ID:            id,
 		TokenID:       tokenID,
 		TokenType:     tokenType,
 		ClientInfo:    clientInfo,
+		SessionID:     sessionID,
 		ExpiresAt:     expiresAt,
 		RevokedBy:     revokedBy,
 		CreatedAt:     createdAt,

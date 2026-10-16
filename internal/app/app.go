@@ -279,7 +279,7 @@ func (a *App) Init() error {
 	a.songTagService.SetPlayHistoryCleaner(db.PlayHistoryRepository())
 
 	// 创建认证服务
-	authService, err := services.NewAuthService(configRepo, db.TokenRepository(), a.config.Username, a.config.Password)
+	authService, err := services.NewAuthService(configRepo, db, db.TokenRepository(), a.config.Username, a.config.Password)
 	if err != nil {
 		return fmt.Errorf("创建认证服务失败: %w", err)
 	}
