@@ -21,8 +21,11 @@ type ScanHandler struct {
 	scanner            *services.Scanner
 	configService      *services.ConfigService
 	fingerprintService *services.FingerprintService
-	onMusicPathChanged func()                        // PUT /settings/music-path 完成后触发，重建 Scanner 等副作用
-	onAutoScanChanged  func(services.AutoScanConfig) // PUT /settings/auto-scan 完成后触发，重启自动扫描调度
+	// onPublishMusicPath 以发布边界语义同步应用音乐目录/排除配置：停旧扫描 → 清理 →
+	// 落库 → 换 Scanner，全部成功后才允许返回成功响应；返回新代际号。
+	onPublishMusicPath       func(ctx context.Context, cfg services.MusicPathConfig) (uint64, error)
+	onScanTitleSourceChanged func()                        // PUT /settings/scan-title-source 完成后触发，刷新标题来源
+	onAutoScanChanged        func(services.AutoScanConfig) // PUT /settings/auto-scan 完成后触发，重启自动扫描调度
 }
 
 // NewScanHandler 创建扫描处理器。configService 可为 nil（仅纯扫描端点的测试场景）。
@@ -44,11 +47,18 @@ func (h *ScanHandler) SetScanner(scanner *services.Scanner) {
 	h.scanner = scanner
 }
 
-// SetOnMusicPathChanged 注入 music_path 写后回调（重建 Scanner + 清排除目录中的歌曲）。
-// 同一回调也注册到通用 /configs/{key} 的 onConfigChanged，让 admin 工具直改 music_path 时
-// 副作用同样生效（保持两条入口语义对齐）。
-func (h *ScanHandler) SetOnMusicPathChanged(cb func()) {
-	h.onMusicPathChanged = cb
+// SetMusicPathPublisher 注入 music_path 同步发布回调。
+// 回调必须以发布边界语义完成「停旧扫描 → 新规则清理 → 落库 → 换 Scanner」，
+// 任一环节失败都返回错误（接口据此给出可观察的失败）。
+// 通用 PUT /configs/music_path 也走同一发布流程，两条入口语义保持一致。
+func (h *ScanHandler) SetMusicPathPublisher(cb func(ctx context.Context, cfg services.MusicPathConfig) (uint64, error)) {
+	h.onPublishMusicPath = cb
+}
+
+// SetOnScanTitleSourceChanged 注入 scan_title_source 写后回调（仅刷新标题来源，
+// 不触发扫描停止/曲库清理）。
+func (h *ScanHandler) SetOnScanTitleSourceChanged(cb func()) {
+	h.onScanTitleSourceChanged = cb
 }
 
 // SetOnAutoScanChanged 注入 auto_scan 写后回调（重启自动扫描调度器）。
@@ -288,11 +298,13 @@ const (
 
 // MusicPathSetting /settings/music-path 的请求与响应体。
 // 与 config 表 music_path 行的 JSON value 结构完全一致，便于 admin 工具与业务端点互通。
+// Generation 仅在响应中返回（服务端发布时分配）；请求体中携带会被忽略。
 type MusicPathSetting struct {
 	Path                  string   `json:"path"`
 	ExcludeDirs           []string `json:"exclude_dirs"`
 	ExcludePaths          []string `json:"exclude_paths"`
 	AutoCreateExcludeDirs []string `json:"auto_create_exclude_dirs"`
+	Generation            uint64   `json:"generation,omitempty"`
 }
 
 // GetMusicPathSetting GET /api/v1/settings/music-path
@@ -324,21 +336,19 @@ func (h *ScanHandler) GetMusicPathSetting(w http.ResponseWriter, r *http.Request
 
 // UpdateMusicPathSetting PUT /api/v1/settings/music-path
 // @Summary 更新音乐路径与扫描排除配置
-// @Description 写入 music_path 配置并触发 Scanner 重建 + 清理排除目录中的歌曲（与 admin /configs PUT 的副作用一致）。
+// @Description 以"配置发布边界"语义同步应用：成功响应返回前，使用旧配置的在跑手动/自动扫描必须停止接收新工作并完成收尾（旧结果不再写库、不建歌单、不触发指纹），随后按新规则清除已脱离音乐根目录或进入排除范围的记录（即使旧文件仍存在），最后持久化新一代配置并原子切换 Scanner。任一步骤失败都返回错误且旧配置继续完整可用，不会留下持久配置、内存扫描器与曲库不一致的中间状态；服务重启后也只恢复最后成功发布的那一代。
 // @Tags 扫描管理
 // @Accept json
 // @Produce json
 // @Param request body MusicPathSetting true "配置内容"
 // @Success 200 {object} MusicPathSetting
 // @Failure 400 {object} map[string]string "请求格式错误"
-// @Failure 500 {object} map[string]string "保存配置失败"
+// @Failure 500 {object} map[string]string "停止旧扫描、清理曲库或保存配置失败（旧配置仍可用）"
 // @Security BearerAuth
 // @Router /settings/music-path [put]
 func (h *ScanHandler) UpdateMusicPathSetting(w http.ResponseWriter, r *http.Request) {
-	if h.configService == nil {
-		respondError(w, http.StatusInternalServerError, "configService 未注入", nil)
-		return
-	}
+	// 请求格式/参数校验先行，保证错误响应与历史行为兼容（坏 JSON、空 path 一律 400），
+	// 不依赖发布器是否注入。
 	var req MusicPathSetting
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "请求格式错误", err)
@@ -357,14 +367,28 @@ func (h *ScanHandler) UpdateMusicPathSetting(w http.ResponseWriter, r *http.Requ
 	if req.AutoCreateExcludeDirs == nil {
 		req.AutoCreateExcludeDirs = []string{}
 	}
-	if err := h.configService.SetJSON(musicPathConfigKey, req); err != nil {
-		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
+
+	if h.configService == nil {
+		respondError(w, http.StatusInternalServerError, "configService 未注入", nil)
 		return
 	}
-	// 副作用与通用 PUT /configs/music_path 完全一致（onConfigChanged 回调），异步触发不阻塞 PUT 响应。
-	if h.onMusicPathChanged != nil {
-		go h.onMusicPathChanged()
+	if h.onPublishMusicPath == nil {
+		respondError(w, http.StatusInternalServerError, "配置发布器未注入", nil)
+		return
 	}
+	cfg := services.MusicPathConfig{
+		Path:                  req.Path,
+		ExcludeDirs:           req.ExcludeDirs,
+		ExcludePaths:          req.ExcludePaths,
+		AutoCreateExcludeDirs: req.AutoCreateExcludeDirs,
+	}
+	// 同步走完整个发布流程后才允许返回成功；失败时错误必须可观察。
+	generation, err := h.onPublishMusicPath(r.Context(), cfg)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "应用扫描配置失败，已保留旧配置", err)
+		return
+	}
+	req.Generation = generation
 	respondJSON(w, http.StatusOK, req)
 }
 
@@ -588,8 +612,9 @@ func (h *ScanHandler) UpdateScanTitleSourceSetting(w http.ResponseWriter, r *htt
 		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
 		return
 	}
-	if h.onMusicPathChanged != nil {
-		go h.onMusicPathChanged()
+	// 标题来源与音乐目录/排除规则无关：只刷新提取器配置，不触发停扫描/清曲库。
+	if h.onScanTitleSourceChanged != nil {
+		go h.onScanTitleSourceChanged()
 	}
 	respondJSON(w, http.StatusOK, scanTitleSourceRequest{TitleSource: req.TitleSource})
 }

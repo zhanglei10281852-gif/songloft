@@ -328,6 +328,24 @@ func (s *Scanner) IsFileInExcludedArea(filePath string) bool {
 	return s.ShouldExcludeDir(dirPath)
 }
 
+// OwnsPath 判断一条既有记录（音频文件或 CUE 源路径）是否属于本扫描配置：
+// 位于音乐根目录之下（含根目录本身）且未被任何排除规则命中。
+//
+// 与「文件是否还在磁盘上」无关——配置发布时据此决定记录去留：音乐根目录改走、
+// 或目录新进入排除范围后，即使旧文件真实存在，其记录也必须清除。
+// 路径与音乐根目录的绝对/相对性不一致（如历史相对路径记录撞上绝对根目录）时
+// 无法比较前缀，跳过根目录判定，仅按排除规则处置，避免误删。
+func (s *Scanner) OwnsPath(p string) bool {
+	cleanPath := filepath.Clean(p)
+	root := filepath.Clean(s.config.MusicPath)
+	if filepath.IsAbs(cleanPath) == filepath.IsAbs(root) {
+		if cleanPath != root && !strings.HasPrefix(cleanPath, root+string(os.PathSeparator)) {
+			return false
+		}
+	}
+	return !s.ShouldExcludeDir(filepath.Dir(cleanPath))
+}
+
 // GetMusicPath 获取音乐目录路径
 func (s *Scanner) GetMusicPath() string {
 	return s.config.MusicPath

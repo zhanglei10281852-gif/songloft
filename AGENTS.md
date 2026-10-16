@@ -465,6 +465,28 @@ manager/scheduler 的内存 map 键，以及 `plugin_storage.plugin_entry_path` 
 - **取消不再丢弃已提取结果**（v2.12.0 之后的行为变更）：worker 退出前的结果照样入库，
   `sealAll` 负责冲出 pending 归不了零的残余目录组。以前整批丢弃，用户连续取消两次就白干二十分钟
 
+### music_path 配置发布边界（铁律）
+
+改音乐目录或排除规则（`PUT /settings/music-path` 与通用 `PUT /configs/music_path`）必须走
+`SongService.PublishMusicPath`，**配置更新成功响应就是发布边界**。旧实现「先落库再异步重建
+Scanner + 异步清理」会让旧扫描在切换后继续落库、建歌单、起指纹，清理完的旧目录歌曲被旧批次
+重新写回（复活）。发布流程固定顺序，任一步失败都返回可观察错误并保留旧配置完整可用：
+
+- **关闸 → 停止并 join 旧扫描 → 收尾指纹 → 按新规则清理 → 落库新一代 → 原子换 Scanner**。
+  清理排在落库之前：提交点前后崩溃，重启都只恢复「已成功发布的那一代」
+- 扫描任务启动时一次性捕获 `scannerBinding`（Scanner + generation 代际号），运行期不回读；
+  发布时整体原子替换。代际随 `music_path` JSON 持久化（`generation` 字段，服务端分配）
+- **两种停止语义必须区分**：用户取消（`/scan/cancel`）保留已提取成果（sealAll + flush）；
+  配置发布停止（`scanRun.switchCh`）丢弃发现/提取/待提交/CUE 中的全部旧结果，不建歌单、
+  不起指纹。所有写库收口点（`flushScanBatch`、`processCueSheet`、自动歌单/指纹）动手前必须
+  复核 `run.abandoned`——新增任何扫描派生的副作用都要带这道屏障
+- 发布闸门（`publishing`）期间手动/自动扫描一律不得启动；扫描注册与关闸共用 `startMu`，
+  锁序固定 `startMu → scanRegMu`，避免「关闸后又登记新 run」
+- 清理用 `cleanSongsForConfig` + `Scanner.OwnsPath`：脱离新根目录或进入排除区的记录一律删，
+  **即使旧文件仍真实存在**，且 CUE 来源组整组清理；不删磁盘文件。这与
+  `CleanInvalidSongs`（只清文件消失/排除区、跳过 CUE）语义不同，别混用
+- `scan_title_source` 只刷提取器，不触发发布；不要在它的写后回调里重建 Scanner
+
 ### 目录遍历不要逐条目 `os.Stat`（songloft-org/songloft#447）
 
 `scanDirWithCue` / `collectDirNames` 用 `resolveEntry`（`scanner.go`）判断目录项类型：

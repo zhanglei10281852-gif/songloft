@@ -1,0 +1,10 @@
+项目：songloft-org-songloft-f61e58a1-15ee-4f78-80ac-6c63950cf94c
+Session：6acf8931a45e75039f9bc3a3｜Trae 144 轮｜时长 7068 秒｜结论：部分完成｜收录：长程题
+Rubric ID：1｜状态：通过｜期望行为：音乐目录或排除规则更新返回成功时，新配置、当前 Scanner 和曲库清理结果已经共同生效，随后扫描只使用该配置代际。｜实际观察：成功路径先等待旧扫描退出、清理曲库、持久化配置，再原子替换 Scanner｜直接证据：internal/services/scan_publish.go:154-228；定向 services 与 handlers 测试通过
+Rubric ID：2｜状态：通过｜期望行为：配置切换与旧手动扫描并发时，已发现、提取中、待批量提交和 CUE 处理中结果均不能在发布边界后写回，扫描进度可确定收敛。｜实际观察：切换关闭 switchCh、置 abandoned、取消提取并等待 done，批次与 CUE 写入点复核 abandoned｜直接证据：internal/services/scan_publish.go:154-175；TestPublishMusicPath_StopsActiveRunBeforeBoundary 与 TestAbandonedRun_DoesNotWriteBatches race 重复通过
+Rubric ID：3｜状态：通过｜期望行为：音乐根目录从 A 切换到 B 后，即使 A 中的文件仍存在，A 的旧歌曲记录也会被清除，而 B 下符合新规则的记录保留。｜实际观察：清理按新 Scanner 的根目录归属和排除规则筛选本地记录，不以旧文件是否存在为保留条件｜直接证据：internal/services/scan_publish.go:185-193,245-260；TestScannerOwnsPath 通过
+Rubric ID：4｜状态：未通过｜期望行为：配置保存后的扫描停止、Scanner 构建或清理发生可控失败时返回可观察错误，持久配置、内存 Scanner 和曲库不会停在彼此不一致的中间状态。｜实际观察：cleanSongsForConfig 在 SetJSON 前永久删除歌曲；SetJSON 返回错误时函数保留旧配置和旧 Scanner，但不恢复已删除歌曲｜直接证据：internal/services/scan_publish.go:185-210｜原因：曲库清理在配置持久化之前执行，SetJSON 失败时已删除的歌曲不回滚｜影响：持久配置和内存 Scanner 仍指向旧代际，曲库已按新代际删除记录｜证据位置：internal/services/scan_publish.go:185-210
+Rubric ID：5｜状态：通过｜期望行为：自动扫描与配置切换服从同一代际屏障，旧代际不会在切换成功后创建自动歌单、更新完成状态或启动音频指纹任务。｜实际观察：手动与自动扫描共用启动闸门和 scanRun，切换等待旧 run 完成并取消旧扫描启动的指纹任务｜直接证据：internal/services/scan_publish.go:154-183；相关发布边界 race 测试通过
+Rubric ID：6｜状态：未通过｜期望行为：服务重启后只恢复最后一次完整发布的音乐目录配置，失败或未完成切换不会在重启后改变有效曲库归属。｜实际观察：曲库删除发生在配置提交前；进程在清理完成后、SetJSON 前终止时，重启读取旧配置，而已提交的歌曲删除仍保留｜直接证据：internal/services/scan_publish.go:185-208｜原因：进程在曲库清理完成且配置持久化前中断时，重启恢复旧配置但旧配置所属歌曲已被删除｜影响：重启后的有效配置与曲库归属不一致，旧配置不能完整恢复｜证据位置：internal/services/scan_publish.go:185-208
+Rubric ID：7｜状态：通过｜期望行为：无并发切换时的手动和自动扫描、用户取消后保留已提取成果、默认配置、仅修改排除规则以及既有进度和错误响应保持兼容。｜实际观察：用户取消与配置切换使用独立停止原因，普通取消仍保留已提取成果，定向回归测试通过｜直接证据：internal/services/scan_publish.go:20-90；services 与 handlers 定向测试均通过
+关键验证：go test -count=1 ./internal/services -run Test(PublishMusicPath|AbandonedRun|ScannerOwnsPath) PASS；go test -count=1 ./internal/handlers -run TestMusicPathSetting_ PASS；关键并发用例 -race -count=3 PASS

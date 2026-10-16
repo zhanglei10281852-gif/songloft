@@ -350,7 +350,7 @@ The following endpoints are business-oriented configuration interfaces that prov
 
 #### PUT -- Update music path and scan exclusion configuration
 
-After writing the configuration, asynchronously triggers a Scanner rebuild + cleanup of songs in excluded directories (the side effect is consistent with the admin `/configs/music_path` PUT).
+Applies synchronously with "config publish boundary" semantics: before returning success it stops and joins the old scan (old results never write rows / create playlists / start fingerprints), removes records that left the root or entered an excluded area (even if the files still exist), persists the new generation and atomically swaps the Scanner; any failed step returns an error and keeps the old config. Shares the same publish flow as the admin `/configs/music_path` PUT.
 
 **Request body:** Same format as the GET response. `path` cannot be empty.
 
@@ -432,7 +432,7 @@ Once enabled, per-file cost is constant (only the first 120 seconds are sampled)
 **Path:** `/api/v1/settings/scan-title-source`
 **Authentication:** BearerAuth required
 
-Configures the source of the song title during scanning. After switching, a scan in "re-import" mode is required for it to take effect. Triggers a Scanner rebuild after PUT completes.
+Configures the source of the song title during scanning. After switching, a scan in "re-import" mode is required for it to take effect. After PUT completes, only asynchronously refreshes the extractor's title source (no Scanner rebuild, no scan stop).
 
 #### GET response / PUT request body:
 

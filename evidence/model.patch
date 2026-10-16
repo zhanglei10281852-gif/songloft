@@ -1,0 +1,2334 @@
+diff --git a/AGENTS.en.md b/AGENTS.en.md
+index e4a2f0d..3a57726 100644
+--- a/AGENTS.en.md
++++ b/AGENTS.en.md
+@@ -506,6 +506,36 @@ only read as a hang.
+   pending count never reaches zero. Previously the whole batch was dropped, so two consecutive cancels
+   threw away twenty minutes of work
+ 
++### music_path publish boundary (iron rule)
++
++Changing the music directory or exclusion rules (`PUT /settings/music-path` and the generic
++`PUT /configs/music_path`) must go through `SongService.PublishMusicPath`: **the successful config
++response IS the publish boundary**. The old flow ("persist first, rebuild Scanner and clean up
++asynchronously") let an old scan keep writing rows, create playlists and start fingerprints after
++the swap, so songs deleted by cleanup were resurrected by old in-flight batches. The publish order
++is fixed; any failed step returns an observable error and the old config remains fully usable:
++
++- **Close the gate → stop and join the old scan → wind down fingerprints → clean with the new rules
++  → persist the new generation → atomically swap the Scanner**. Cleanup runs before persistence, so a
++  crash on either side of the commit only restores the last successfully published generation
++- A scan captures its `scannerBinding` (Scanner + generation) once at start and never re-reads it;
++  publish replaces the whole binding atomically. The generation is persisted in the `music_path` JSON
++  (`generation` field, assigned server-side)
++- **The two stop semantics must stay distinct**: user cancel (`/scan/cancel`) keeps extracted results
++  (sealAll + flush); a publish stop (`scanRun.switchCh`) discards every old result still in discovery /
++  extraction / pending batch / CUE processing and creates no playlists and no fingerprints. Every DB
++  write chokepoint (`flushScanBatch`, `processCueSheet`, auto playlists/fingerprints) must re-check
++  `run.abandoned` first — any new scan-spawned side effect needs this fence
++- While the publish gate (`publishing`) is closed, neither manual nor automatic scans may start. Scan
++  registration and gate closing share `startMu`; the fixed lock order is `startMu → scanRegMu`, so no
++  run can register after the gate closes
++- Cleanup uses `cleanSongsForConfig` + `Scanner.OwnsPath`: records outside the new music root or
++  inside the new exclusion area are deleted **even though the old files still exist on disk**, and CUE
++  source groups are deleted as a whole; disk files are never removed. This differs from
++  `CleanInvalidSongs` (missing-file/excluded-area only, skips CUE) — don't mix them up
++- `scan_title_source` only refreshes the extractor; it must not trigger a publish or rebuild the
++  Scanner in its change callback
++
+ ### Never `os.Stat` every directory entry (songloft-org/songloft#447)
+ 
+ `scanDirWithCue` / `collectDirNames` determine entry types via `resolveEntry` (`scanner.go`):
+diff --git a/AGENTS.md b/AGENTS.md
+index d7986f1..044ae33 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -465,6 +465,28 @@ manager/scheduler 的内存 map 键，以及 `plugin_storage.plugin_entry_path`
+ - **取消不再丢弃已提取结果**（v2.12.0 之后的行为变更）：worker 退出前的结果照样入库，
+   `sealAll` 负责冲出 pending 归不了零的残余目录组。以前整批丢弃，用户连续取消两次就白干二十分钟
+ 
++### music_path 配置发布边界（铁律）
++
++改音乐目录或排除规则（`PUT /settings/music-path` 与通用 `PUT /configs/music_path`）必须走
++`SongService.PublishMusicPath`，**配置更新成功响应就是发布边界**。旧实现「先落库再异步重建
++Scanner + 异步清理」会让旧扫描在切换后继续落库、建歌单、起指纹，清理完的旧目录歌曲被旧批次
++重新写回（复活）。发布流程固定顺序，任一步失败都返回可观察错误并保留旧配置完整可用：
++
++- **关闸 → 停止并 join 旧扫描 → 收尾指纹 → 按新规则清理 → 落库新一代 → 原子换 Scanner**。
++  清理排在落库之前：提交点前后崩溃，重启都只恢复「已成功发布的那一代」
++- 扫描任务启动时一次性捕获 `scannerBinding`（Scanner + generation 代际号），运行期不回读；
++  发布时整体原子替换。代际随 `music_path` JSON 持久化（`generation` 字段，服务端分配）
++- **两种停止语义必须区分**：用户取消（`/scan/cancel`）保留已提取成果（sealAll + flush）；
++  配置发布停止（`scanRun.switchCh`）丢弃发现/提取/待提交/CUE 中的全部旧结果，不建歌单、
++  不起指纹。所有写库收口点（`flushScanBatch`、`processCueSheet`、自动歌单/指纹）动手前必须
++  复核 `run.abandoned`——新增任何扫描派生的副作用都要带这道屏障
++- 发布闸门（`publishing`）期间手动/自动扫描一律不得启动；扫描注册与关闸共用 `startMu`，
++  锁序固定 `startMu → scanRegMu`，避免「关闸后又登记新 run」
++- 清理用 `cleanSongsForConfig` + `Scanner.OwnsPath`：脱离新根目录或进入排除区的记录一律删，
++  **即使旧文件仍真实存在**，且 CUE 来源组整组清理；不删磁盘文件。这与
++  `CleanInvalidSongs`（只清文件消失/排除区、跳过 CUE）语义不同，别混用
++- `scan_title_source` 只刷提取器，不触发发布；不要在它的写后回调里重建 Scanner
++
+ ### 目录遍历不要逐条目 `os.Stat`（songloft-org/songloft#447）
+ 
+ `scanDirWithCue` / `collectDirNames` 用 `resolveEntry`（`scanner.go`）判断目录项类型：
+diff --git a/docs/docs.go b/docs/docs.go
+index e67682e..0aa561d 100644
+--- a/docs/docs.go
++++ b/docs/docs.go
+@@ -5061,7 +5061,7 @@ const docTemplate = `{
+                         "BearerAuth": []
+                     }
+                 ],
+-                "description": "写入 music_path 配置并触发 Scanner 重建 + 清理排除目录中的歌曲（与 admin /configs PUT 的副作用一致）。",
++                "description": "以\"配置发布边界\"语义同步应用：成功响应返回前，使用旧配置的在跑手动/自动扫描必须停止接收新工作并完成收尾（旧结果不再写库、不建歌单、不触发指纹），随后按新规则清除已脱离音乐根目录或进入排除范围的记录（即使旧文件仍存在），最后持久化新一代配置并原子切换 Scanner。任一步骤失败都返回错误且旧配置继续完整可用，不会留下持久配置、内存扫描器与曲库不一致的中间状态；服务重启后也只恢复最后成功发布的那一代。",
+                 "consumes": [
+                     "application/json"
+                 ],
+@@ -5100,7 +5100,7 @@ const docTemplate = `{
+                         }
+                     },
+                     "500": {
+-                        "description": "保存配置失败",
++                        "description": "停止旧扫描、清理曲库或保存配置失败（旧配置仍可用）",
+                         "schema": {
+                             "type": "object",
+                             "additionalProperties": {
+@@ -10217,6 +10217,9 @@ const docTemplate = `{
+                         "type": "string"
+                     }
+                 },
++                "generation": {
++                    "type": "integer"
++                },
+                 "path": {
+                     "type": "string"
+                 }
+diff --git "a/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md" "b/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md"
+index 77d3ad1..d6bf6f5 100644
+--- "a/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md"	
++++ "b/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md"	
+@@ -350,7 +350,7 @@ The following endpoints are business-oriented configuration interfaces that prov
+ 
+ #### PUT -- Update music path and scan exclusion configuration
+ 
+-After writing the configuration, asynchronously triggers a Scanner rebuild + cleanup of songs in excluded directories (the side effect is consistent with the admin `/configs/music_path` PUT).
++Applies synchronously with "config publish boundary" semantics: before returning success it stops and joins the old scan (old results never write rows / create playlists / start fingerprints), removes records that left the root or entered an excluded area (even if the files still exist), persists the new generation and atomically swaps the Scanner; any failed step returns an error and keeps the old config. Shares the same publish flow as the admin `/configs/music_path` PUT.
+ 
+ **Request body:** Same format as the GET response. `path` cannot be empty.
+ 
+@@ -432,7 +432,7 @@ Once enabled, per-file cost is constant (only the first 120 seconds are sampled)
+ **Path:** `/api/v1/settings/scan-title-source`
+ **Authentication:** BearerAuth required
+ 
+-Configures the source of the song title during scanning. After switching, a scan in "re-import" mode is required for it to take effect. Triggers a Scanner rebuild after PUT completes.
++Configures the source of the song title during scanning. After switching, a scan in "re-import" mode is required for it to take effect. After PUT completes, only asynchronously refreshes the extractor's title source (no Scanner rebuild, no scan stop).
+ 
+ #### GET response / PUT request body:
+ 
+diff --git "a/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md" "b/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md"
+index 0650e22..b7eb6d3 100644
+--- "a/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md"	
++++ "b/docs/en/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md"	
+@@ -47,7 +47,7 @@ Songloft has two categories of configuration interfaces, and user-facing feature
+ | **Business settings** | `/settings/<name>` | User-facing feature switches | Strongly-typed JSON, built-in defaults, triggers side effects after PUT |
+ | **Generic KV** | `/configs/{key}` | Admin editor only | Pure string KV, PUT returns 404 when the key does not exist, no defaults |
+ 
+-Client business features always go through the `/settings/*` endpoints (`SettingsApi`); `/configs/{key}` is used only by the frontend `config_manager.dart` generic configuration editor (`ConfigApi`). Both can read/write the same underlying config key (dual entry retained), and side effects are triggered uniformly by the `configHandler.SetOnConfigChanged` callback.
++Client business features always go through the `/settings/*` endpoints (`SettingsApi`); `/configs/{key}` is used only by the frontend `config_manager.dart` generic configuration editor (`ConfigApi`). Both can read/write the same underlying config key (dual entry retained): `music_path` is intercepted by `beforeConfigChange` and goes through the synchronous SongService.PublishMusicPath boundary, while other keys use the asynchronous `onConfigChanged` callback.
+ 
+ ---
+ 
+@@ -93,7 +93,7 @@ Gets a single configuration.
+ 
+ ### PUT /api/v1/configs/{key}
+ 
+-Updates an existing configuration. The configuration must already exist, otherwise it returns 404. After the update, asynchronously triggers the `onConfigChanged` callback (`music_path` rebuilds the Scanner, `auto_scan` restarts the scheduler).
++Updates an existing configuration. The configuration must already exist, otherwise it returns 404. After the update, asynchronously triggers the `onConfigChanged` callback (`auto_scan` restarts the scheduler); `music_path` is the exception — it is intercepted before persistence by `beforeConfigChange` and goes through the synchronous publish boundary (stop old scan, clean with the new rules, persist, swap Scanner).
+ 
+ - **Authentication**: Bearer Token
+ - **Path parameter**: `key` (string)
+@@ -138,7 +138,7 @@ All business settings endpoints follow a uniform pattern: GET returns the curren
+ | `exclude_dirs` | string[] | `["@eaDir","tmp"]` | Exclude by directory name |
+ | `exclude_paths` | string[] | `[]` | Exclude by full path |
+ 
+-- **PUT side effect**: Asynchronously triggers `onMusicPathChanged` (rebuilds the Scanner + cleans up songs in excluded directories)
++- **PUT side effect**: Runs the synchronous config publish (PublishMusicPath): stops and joins the old scan, cleans the library with the new rules, persists the new generation and atomically swaps the Scanner; success is returned only after every step succeeds
+ - **400**: Empty path | **500**: Save failed
+ 
+ ### 3.2 HLS Proxy Switch
+@@ -173,7 +173,7 @@ Disabled by default, with an interval of 3600 seconds (1 hour). PUT validates th
+ 
+ After switching, a scan in "re-import" mode is required for it to take effect.
+ 
+-- **PUT side effect**: Asynchronously triggers a Scanner rebuild
++- **PUT side effect**: Asynchronously refreshes the metadata title source only (no Scanner rebuild, no scan stop)
+ - **400**: title_source is not `tag` or `filename`
+ 
+ ### 3.5 Scan Auto-Create Playlists
+diff --git "a/docs/en/repowiki/\345\220\216\347\253\257\347\263\273\347\273\237\350\256\276\350\256\241/API \346\216\245\345\217\243\350\256\276\350\256\241.md" "b/docs/en/repowiki/\345\220\216\347\253\257\347\263\273\347\273\237\350\256\276\350\256\241/API \346\216\245\345\217\243\350\256\276\350\256\241.md"
+index f14a14d..e3e81eb 100644
+--- "a/docs/en/repowiki/\345\220\216\347\253\257\347\263\273\347\273\237\350\256\276\350\256\241/API \346\216\245\345\217\243\350\256\276\350\256\241.md"	
++++ "b/docs/en/repowiki/\345\220\216\347\253\257\347\263\273\347\273\237\350\256\276\350\256\241/API \346\216\245\345\217\243\350\256\276\350\256\241.md"	
+@@ -156,7 +156,7 @@ The project has 14 Handlers in total, all located in `internal/handlers/`:
+ 
+ ### 5.3 Callback Injection
+ 
+-Some handlers bind cross-module callbacks via setters: `configHandler.SetOnConfigChanged` triggers side effects after a generic KV write, `scanHandler.SetOnMusicPathChanged` / `SetOnAutoScanChanged` bind rebuild logic after config changes, and `songHandler.SetGetMusicPath` lazily injects the Scanner's path function.
++Some handlers bind cross-module callbacks via setters: `configHandler.SetBeforeConfigChange` intercepts a KV write before persistence (used by `music_path` to run the synchronous publish boundary via `SongService.PublishMusicPath`), `configHandler.SetOnConfigChanged` triggers side effects after other generic KV writes, `scanHandler.SetMusicPathPublisher` / `SetOnAutoScanChanged` bind the publish flow and auto-scan rescheduling, and `songHandler.SetGetMusicPath` injects a closure that always reads the currently published Scanner's path.
+ 
+ ---
+ 
+diff --git "a/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md" "b/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md"
+index 05b3a9e..0d87c35 100644
+--- "a/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md"
++++ "b/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md"
+@@ -123,7 +123,7 @@ All business endpoints support both GET and PUT: GET returns the current value (
+ 
+ - **config key**: `music_path` (JSON value)
+ - **handler**: `ScanHandler`
+-- **Side effect**: after PUT, asynchronously calls the `onMusicPathChanged` callback, rebuilding the Scanner and clearing songs in excluded directories
++- **Side effect**: PUT runs the synchronous `SongService.PublishMusicPath` boundary — close the gate against new scans, stop and join the old scan (all old results are discarded: no playlists, no fingerprints), remove records outside the new root or inside a new exclusion area (even if the files still exist, including CUE groups), persist the new generation and atomically swap the Scanner; any failed step returns an error with the old config fully usable, and restart only restores a published generation
+ - **Validation**: `path` cannot be empty
+ 
+ ### 4.2 /settings/hls-proxy
+@@ -156,7 +156,7 @@ All business endpoints support both GET and PUT: GET returns the current value (
+ 
+ - **config key**: `scan_title_source` (string value)
+ - **handler**: `ScanHandler`
+-- **Side effect**: after PUT, triggers `onMusicPathChanged` (a scan in "re-import" mode is required for it to take effect)
++- **Side effect**: after PUT, asynchronously refreshes the extractor's title source (no Scanner rebuild, no scan stop; a scan in "re-import" mode is required for it to take effect)
+ - **Validation**: value must be `"tag"` or `"filename"`
+ 
+ ### 4.5 /settings/scan-auto-create-playlists
+@@ -243,21 +243,27 @@ After the generic KV endpoint `PUT /configs/{key}` updates a config, it triggers
+ ### 5.1 Callback Registration
+ 
+ ```go
+-// routers.go 中的注册逻辑
++// routers.go wiring
++// music_path: intercepted before persistence, synchronously runs the publish
++// boundary (a successful response means the boundary is complete)
++configHandler.SetBeforeConfigChange(func(key, value string) (bool, error) {
++    if key != "music_path" {
++        return false, nil
++    }
++    return true, songService.PublishMusicPath(ctx, cfg, scanHandler.SetScanner /*afterSwap*/)
++})
++// Other keys: asynchronous callback after persistence
+ configHandler.SetOnConfigChanged(func(key string) {
+-    switch key {
+-    case "music_path":
+-        musicPathChanged()       // 重建 Scanner + 清理排除歌曲
+-    case "auto_scan":
++    if key == "auto_scan" {
+         cfg := a.autoScanner.GetConfig()
+-        a.autoScanner.ApplyConfig(cfg)  // 重启自动扫描调度
++        a.autoScanner.ApplyConfig(cfg)  // reschedule the auto-scan ticker
+     }
+ })
+ ```
+ 
+ ### 5.2 Dual-Entry Consistency
+ 
+-The callback runs asynchronously via `go` and does not block the PUT response. When a business endpoint and the generic endpoint write the same config key, they must trigger the same side effect. For example, `PUT /settings/music-path` calls `onMusicPathChanged()` directly inside the handler, while `PUT /configs/music_path` triggers the same function indirectly through `configHandler.onConfigChanged("music_path")`.
++Both write entries for `music_path` (the business endpoint and the generic KV) converge on `SongService.PublishMusicPath`, which **synchronously** completes "gate + stop old scan, clean with the new rules, persist the new generation, swap the Scanner" before returning success: `PUT /settings/music-path` calls the publisher directly in the handler, while `PUT /configs/music_path` is intercepted by `beforeConfigChange` and calls the same function. Other config keys keep the asynchronous `onConfigChanged` callback.
+ 
+ ---
+ 
+diff --git "a/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md" "b/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md"
+index 8bd35e3..7df1794 100644
+--- "a/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md"
++++ "b/docs/en/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md"
+@@ -45,7 +45,7 @@ This document is based on the following source files:
+ 
+ `supported_formats` is stored in the `scan_config` config. DSF (DSD) is included in the default whitelist; migration `0039_scan_support_dsf.sql` idempotently adds `dsf` to existing deployments (case-insensitive). Rescan after upgrading to import the files. `pkg/tag` reads DSF tags and cover art but does not support writing tags back to DSF. Playback uses libmpv / ffmpeg; browsers or DLNA devices without DSD support need to explicitly request transcoding with a parameter such as `?format=mp3`. The current Web client does not add one automatically for DSF.
+ 
+-The music path and exclusion rules are stored under the `music_path` key in the configs table and read/written through the `/api/v1/settings/music-path` business endpoint. When the config changes, the `onMusicPathChanged` callback fires, rebuilding the Scanner instance and cleaning up existing songs within the excluded areas.
++The music path and exclusion rules are stored under the `music_path` key in the configs table and read/written through the `/api/v1/settings/music-path` business endpoint. A config change goes through the synchronous `SongService.PublishMusicPath` boundary: stop and join the old-config scan (old results write no rows, create no playlists, start no fingerprints), remove records that left the root or entered an exclusion area (even if the files still exist, including CUE groups), persist the new generation and atomically swap the Scanner; any failed step returns an error with the old config fully usable.
+ 
+ ### 1.2 Recursive Traversal (Walker)
+ 
+diff --git "a/docs/en/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md" "b/docs/en/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md"
+index 07bc99e..75581d7 100644
+--- "a/docs/en/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md"
++++ "b/docs/en/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md"
+@@ -548,11 +548,11 @@ The system uses the SQLite config table to store all runtime configuration, taki
+ 
+ - **Log level**: dynamically switched via `slog.LevelVar`; `PUT /settings/log-level` takes effect immediately
+ - **HTTP proxy**: the shared Transport is updated immediately via `httputil.SetGlobalProxy`
+-- **Music path**: after a change, triggers the `onMusicPathConfigChanged` callback, rebuilding the Scanner and asynchronously cleaning up invalid songs
++- **Music path**: changes go through the synchronous `SongService.PublishMusicPath` boundary — close the gate and stop/join the old scan, clean the library with the new rules, persist the new generation and atomically swap the Scanner; the endpoint returns success only after all steps, and a failure keeps the old config
+ - **Automatic scanning**: after a change, rescheduled via `autoScanner.ApplyConfig`
+-- **Generic KV callback**: `configHandler.SetOnConfigChanged` registers key-level change callbacks (such as `music_path`, `auto_scan`), keeping the side effects of the generic `/configs/{key}` entry consistent with the business endpoints
++- **Generic KV callback**: `configHandler.SetOnConfigChanged` registers key-level change callbacks (such as `auto_scan`); `music_path` is instead intercepted by `SetBeforeConfigChange` and routed to the same publish flow, keeping the generic `/configs/{key}` entry semantically aligned with the business endpoint
+ 
+-**Section sources**: `internal/app/app.go:88-92` (LevelVar initialization), `internal/app/app.go:128-138` (HTTP proxy restoration), `internal/app/app.go:394-456` (onMusicPathConfigChanged), `internal/app/routers.go:63-71` (SetOnConfigChanged callback)
++**Section sources**: `internal/app/routers.go` (PublishMusicPath wiring, SetBeforeConfigChange / SetOnConfigChanged callbacks), `internal/services/scan_publish.go` (publish boundary and generation coordination)
+ 
+ ---
+ 
+diff --git "a/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md" "b/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md"
+index 392f9cb..479516d 100644
+--- "a/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md"	
++++ "b/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\346\211\253\346\217\217\347\256\241\347\220\206 API.md"	
+@@ -350,7 +350,7 @@
+ 
+ #### PUT -- 更新音乐路径与扫描排除配置
+ 
+-写入配置后异步触发 Scanner 重建 + 清理排除目录中的歌曲（副作用与 admin `/configs/music_path` PUT 一致）。
++以「配置发布边界」语义同步应用：成功响应返回前停止并 join 旧扫描（旧结果不再写库/建歌单/起指纹）、按新规则清除脱离根目录或进入排除区的记录（即使文件仍存在）、持久化新一代配置并原子切换 Scanner；任一步失败返回错误并保留旧配置。与 admin `/configs/music_path` PUT 走同一发布流程。
+ 
+ **请求体:** 同 GET 响应格式。`path` 不能为空。
+ 
+@@ -432,7 +432,7 @@
+ **路径:** `/api/v1/settings/scan-title-source`
+ **认证:** 需要 BearerAuth
+ 
+-配置扫描时歌曲标题的来源方式。切换后需以「重新导入」模式扫描才能生效。PUT 完成后触发 Scanner 重建。
++配置扫描时歌曲标题的来源方式。切换后需以「重新导入」模式扫描才能生效。PUT 完成后仅异步刷新提取器的标题来源（不重建 Scanner、不停止扫描）。
+ 
+ #### GET 响应 / PUT 请求体:
+ 
+diff --git "a/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md" "b/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md"
+index b6befca..4cf271f 100644
+--- "a/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md"	
++++ "b/docs/repowiki/API \346\216\245\345\217\243\345\217\202\350\200\203/\351\205\215\347\275\256\344\270\216\350\256\276\347\275\256 API.md"	
+@@ -47,7 +47,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端
+ | **业务设置** | `/settings/<name>` | 用户可见功能开关 | 强类型 JSON、自带默认值、PUT 后触发副作用 |
+ | **通用 KV** | `/configs/{key}` | admin 编辑器专用 | 纯字符串 KV、PUT 时 key 不存在返回 404、无默认值 |
+ 
+-客户端业务功能一律走 `/settings/*` 端点（`SettingsApi`）；`/configs/{key}` 仅供前端 `config_manager.dart` 通用配置编辑器使用（`ConfigApi`）。两者可读写同一底层 config key（保留双入口），副作用由 `configHandler.SetOnConfigChanged` 回调统一触发。
++客户端业务功能一律走 `/settings/*` 端点（`SettingsApi`）；`/configs/{key}` 仅供前端 `config_manager.dart` 通用配置编辑器使用（`ConfigApi`）。两者可读写同一底层 config key（保留双入口）：`music_path` 由 `beforeConfigChange` 拦截后走 SongService.PublishMusicPath 同步发布，其余 key 由 `onConfigChanged` 异步回调。
+ 
+ ---
+ 
+@@ -93,7 +93,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端
+ 
+ ### PUT /api/v1/configs/{key}
+ 
+-更新已有配置。配置必须已存在，否则返回 404。更新后异步触发 `onConfigChanged` 回调（`music_path` 重建 Scanner，`auto_scan` 重启调度）。
++更新已有配置。配置必须已存在，否则返回 404。更新后异步触发 `onConfigChanged` 回调（`auto_scan` 重启调度）；`music_path` 例外——落库前被 `beforeConfigChange` 拦截，改走同步的配置发布边界（停旧扫描 → 按新规则清理 → 落库 → 换 Scanner）。
+ 
+ - **认证**: Bearer Token
+ - **路径参数**: `key`（string）
+@@ -138,7 +138,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端
+ | `exclude_dirs` | string[] | `["@eaDir","tmp"]` | 按目录名排除 |
+ | `exclude_paths` | string[] | `[]` | 按完整路径排除 |
+ 
+-- **PUT 副作用**: 异步触发 `onMusicPathChanged`（重建 Scanner + 清理排除目录歌曲）
++- **PUT 副作用**: 同步执行配置发布（PublishMusicPath）：停旧扫描并 join、按新规则清理曲库、落库新一代配置、原子切换 Scanner，全部成功才返回
+ - **400**: path 为空 | **500**: 保存失败
+ 
+ ### 3.2 HLS 代理开关
+@@ -173,7 +173,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端
+ 
+ 切换后需以"重新导入"模式扫描才能生效。
+ 
+-- **PUT 副作用**: 异步触发 Scanner 重建
++- **PUT 副作用**: 异步刷新元数据标题来源（不重建 Scanner、不停止扫描）
+ - **400**: title_source 不是 `tag` 或 `filename`
+ 
+ ### 3.5 扫描自动创建歌单
+diff --git "a/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md" "b/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md"
+index a26d0cc..c643356 100644
+--- "a/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md"
++++ "b/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\205\215\347\275\256\347\256\241\347\220\206.md"
+@@ -123,7 +123,7 @@ ConfigService 提供一组类型化的读写方法，将 `configs` 表的 string
+ 
+ - **config key**：`music_path`（JSON 值）
+ - **handler**：`ScanHandler`
+-- **副作用**：PUT 后异步调用 `onMusicPathChanged` 回调，重建 Scanner 并清理排除目录中的歌曲
++- **副作用**：PUT 同步走 `SongService.PublishMusicPath` 发布边界——关闸拒绝新扫描 → 停止并 join 旧扫描（旧结果一律丢弃，不建歌单/不起指纹）→ 按新规则清理脱离根目录或进入排除区的记录（文件仍存在也删，含 CUE 组）→ 落库新一代配置 → 原子换 Scanner；任一步失败返回错误且旧配置完整可用，重启只恢复已成功发布的代际
+ - **验证**：`path` 不能为空
+ 
+ ### 4.2 /settings/hls-proxy
+@@ -156,7 +156,7 @@ ConfigService 提供一组类型化的读写方法，将 `configs` 表的 string
+ 
+ - **config key**：`scan_title_source`（字符串值）
+ - **handler**：`ScanHandler`
+-- **副作用**：PUT 后触发 `onMusicPathChanged`（需以「重新导入」模式扫描才能生效）
++- **副作用**：PUT 后异步刷新提取器的标题来源（不重建 Scanner、不停止扫描；需以「重新导入」模式扫描才能生效）
+ - **验证**：值必须为 `"tag"` 或 `"filename"`
+ 
+ ### 4.5 /settings/scan-auto-create-playlists
+@@ -244,11 +244,16 @@ ConfigService 提供一组类型化的读写方法，将 `configs` 表的 string
+ 
+ ```go
+ // routers.go 中的注册逻辑
++// music_path：落库前拦截，同步走发布边界（成功响应=边界完成）
++configHandler.SetBeforeConfigChange(func(key, value string) (bool, error) {
++    if key != "music_path" {
++        return false, nil
++    }
++    return true, songService.PublishMusicPath(ctx, cfg, scanHandler.SetScanner /*afterSwap*/)
++})
++// 其余 key：落库后异步回调
+ configHandler.SetOnConfigChanged(func(key string) {
+-    switch key {
+-    case "music_path":
+-        musicPathChanged()       // 重建 Scanner + 清理排除歌曲
+-    case "auto_scan":
++    if key == "auto_scan" {
+         cfg := a.autoScanner.GetConfig()
+         a.autoScanner.ApplyConfig(cfg)  // 重启自动扫描调度
+     }
+@@ -257,7 +262,7 @@ configHandler.SetOnConfigChanged(func(key string) {
+ 
+ ### 5.2 双入口一致性
+ 
+-回调通过 `go` 异步执行，不阻塞 PUT 响应。业务端点和通用端点写同一 config key 时，必须触发相同的副作用。例如 `PUT /settings/music-path` 在 handler 内直接调用 `onMusicPathChanged()`，而 `PUT /configs/music_path` 通过 `configHandler.onConfigChanged("music_path")` 间接触发同一函数。
++`music_path` 的两条写入口（业务端点与通用 KV）都收敛到 `SongService.PublishMusicPath`，**同步**完成「关闸停旧扫描 → 按新规则清理 → 落库新一代 → 换 Scanner」后才返回成功：`PUT /settings/music-path` 在 handler 内直接调用发布器，`PUT /configs/music_path` 被 `beforeConfigChange` 拦截后调用同一函数。其余 config key 仍由 `onConfigChanged` 异步回调。
+ 
+ ---
+ 
+diff --git "a/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md" "b/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md"
+index a8f4e7d..1e2860a 100644
+--- "a/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md"
++++ "b/docs/repowiki/\346\240\270\345\277\203\345\212\237\350\203\275\345\256\236\347\216\260/\351\237\263\344\271\220\347\256\241\347\220\206.md"
+@@ -45,7 +45,7 @@
+ 
+ `supported_formats` 存储在 `scan_config` 配置中。DSF（DSD）默认在白名单内；迁移 `0039_scan_support_dsf.sql` 为已有部署幂等补入 `dsf`（大小写无关），升级后重新扫描即可入库。`pkg/tag` 可读取 DSF 标签和封面，但不支持 DSF 标签写回；播放沿用 libmpv / ffmpeg，浏览器或不支持 DSD 的 DLNA 设备需显式传 `?format=mp3` 等参数请求转码，当前 Web 客户端不会为 DSF 自动追加。
+ 
+-音乐路径与排除规则存储在 configs 表的 `music_path` 键中，通过 `/api/v1/settings/music-path` 业务端点读写。配置变更时触发 `onMusicPathChanged` 回调，重建 Scanner 实例并清理排除区域内的已有歌曲。
++音乐路径与排除规则存储在 configs 表的 `music_path` 键中，通过 `/api/v1/settings/music-path` 业务端点读写。配置变更走 `SongService.PublishMusicPath` 同步发布边界：停止并 join 旧配置扫描（旧结果不写库、不建歌单、不起指纹），按新规则清除脱离根目录或进入排除区的记录（即使文件仍存在，含 CUE 组），落库新一代配置后原子替换 Scanner；任一步失败返回错误并保留旧配置完整可用。
+ 
+ ### 1.2 递归遍历（Walker）
+ 
+diff --git "a/docs/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md" "b/docs/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md"
+index c692f52..8af585c 100644
+--- "a/docs/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md"
++++ "b/docs/repowiki/\347\263\273\347\273\237\346\236\266\346\236\204\350\256\276\350\256\241.md"
+@@ -559,11 +559,11 @@ jsplugin.Manager (生命周期管理)
+ 
+ - **日志等级**：通过 `slog.LevelVar` 动态切换，`PUT /settings/log-level` 即时生效
+ - **HTTP 代理**：通过 `httputil.SetGlobalProxy` 即时更新共享 Transport
+-- **音乐路径**：变更后触发 `onMusicPathConfigChanged` 回调，重建 Scanner 并异步清理无效歌曲
++- **音乐路径**：变更走 `SongService.PublishMusicPath` 同步发布边界——关闸停旧扫描并 join、按新规则清理曲库、落库新一代配置、原子切换 Scanner，全部成功后接口才返回；失败保留旧配置
+ - **自动扫描**：变更后通过 `autoScanner.ApplyConfig` 重新调度
+-- **通用 KV 回调**：`configHandler.SetOnConfigChanged` 注册 key 级别的变更回调（如 `music_path`、`auto_scan`），保持 `/configs/{key}` 通用入口与业务端点副作用一致
++- **通用 KV 回调**：`configHandler.SetOnConfigChanged` 注册 key 级别的变更回调（如 `auto_scan`）；`music_path` 改由 `SetBeforeConfigChange` 拦截后走同一发布流程，保持 `/configs/{key}` 与业务端点语义一致
+ 
+-**章节来源**: `internal/app/app.go:88-92`（LevelVar 初始化）、`internal/app/app.go:128-138`（HTTP 代理恢复）、`internal/app/app.go:394-456`（onMusicPathConfigChanged）、`internal/app/routers.go:78-86`（SetOnConfigChanged 回调）
++**章节来源**: `internal/app/app.go:88-92`（LevelVar 初始化）、`internal/app/app.go:128-138`（HTTP 代理恢复）、`internal/app/routers.go`（PublishMusicPath 接线、SetBeforeConfigChange / SetOnConfigChanged 回调）、`internal/services/scan_publish.go`（发布边界与代际协调）
+ 
+ ---
+ 
+diff --git a/docs/swagger.json b/docs/swagger.json
+index 1739389..6a98878 100644
+--- a/docs/swagger.json
++++ b/docs/swagger.json
+@@ -5055,7 +5055,7 @@
+                         "BearerAuth": []
+                     }
+                 ],
+-                "description": "写入 music_path 配置并触发 Scanner 重建 + 清理排除目录中的歌曲（与 admin /configs PUT 的副作用一致）。",
++                "description": "以\"配置发布边界\"语义同步应用：成功响应返回前，使用旧配置的在跑手动/自动扫描必须停止接收新工作并完成收尾（旧结果不再写库、不建歌单、不触发指纹），随后按新规则清除已脱离音乐根目录或进入排除范围的记录（即使旧文件仍存在），最后持久化新一代配置并原子切换 Scanner。任一步骤失败都返回错误且旧配置继续完整可用，不会留下持久配置、内存扫描器与曲库不一致的中间状态；服务重启后也只恢复最后成功发布的那一代。",
+                 "consumes": [
+                     "application/json"
+                 ],
+@@ -5094,7 +5094,7 @@
+                         }
+                     },
+                     "500": {
+-                        "description": "保存配置失败",
++                        "description": "停止旧扫描、清理曲库或保存配置失败（旧配置仍可用）",
+                         "schema": {
+                             "type": "object",
+                             "additionalProperties": {
+@@ -10211,6 +10211,9 @@
+                         "type": "string"
+                     }
+                 },
++                "generation": {
++                    "type": "integer"
++                },
+                 "path": {
+                     "type": "string"
+                 }
+diff --git a/docs/swagger.yaml b/docs/swagger.yaml
+index cc55814..350654a 100644
+--- a/docs/swagger.yaml
++++ b/docs/swagger.yaml
+@@ -65,6 +65,8 @@ definitions:
+         items:
+           type: string
+         type: array
++      generation:
++        type: integer
+       path:
+         type: string
+     type: object
+@@ -4839,8 +4841,8 @@ paths:
+     put:
+       consumes:
+       - application/json
+-      description: 写入 music_path 配置并触发 Scanner 重建 + 清理排除目录中的歌曲（与 admin /configs PUT
+-        的副作用一致）。
++      description: 以"配置发布边界"语义同步应用：成功响应返回前，使用旧配置的在跑手动/自动扫描必须停止接收新工作并完成收尾（旧结果不再写库、不建歌单、不触发指纹），随后按新规则清除已脱离音乐根目录或进入排除范围的记录（即使旧文件仍存在），最后持久化新一代配置并原子切换
++        Scanner。任一步骤失败都返回错误且旧配置继续完整可用，不会留下持久配置、内存扫描器与曲库不一致的中间状态；服务重启后也只恢复最后成功发布的那一代。
+       parameters:
+       - description: 配置内容
+         in: body
+@@ -4862,7 +4864,7 @@ paths:
+               type: string
+             type: object
+         "500":
+-          description: 保存配置失败
++          description: 停止旧扫描、清理曲库或保存配置失败（旧配置仍可用）
+           schema:
+             additionalProperties:
+               type: string
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 99476a9..c32bff5 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -503,70 +503,6 @@ func (a *App) Init() error {
+ 	return nil
+ }
+ 
+-// onMusicPathConfigChanged 处理 music_path 配置变更
+-// 重建 Scanner（使用新的排除配置）并触发清理排除目录中的歌曲
+-func (a *App) onMusicPathConfigChanged(scanHandler *handlers.ScanHandler) {
+-	// 重新读取 music_path 配置
+-	var musicPathConfig struct {
+-		Path         string   `json:"path"`
+-		ExcludeDirs  []string `json:"exclude_dirs"`
+-		ExcludePaths []string `json:"exclude_paths"`
+-	}
+-	if err := a.configService.GetJSON("music_path", &musicPathConfig); err != nil {
+-		slog.Error("配置变更回调：读取 music_path 配置失败", "error", err)
+-		return
+-	}
+-
+-	// 重新读取扫描配置（获取 SupportedFormats）
+-	var scanConfigData struct {
+-		SupportedFormats []string `json:"supported_formats"`
+-	}
+-	if err := a.configService.GetJSON("scan_config", &scanConfigData); err != nil {
+-		slog.Warn("配置变更回调：读取 scan_config 失败，使用默认值", "error", err)
+-		scanConfigData.SupportedFormats = []string{"mp3", "flac", "wav", "ape", "ogg", "m4a", "mp4", "mov", "wma", "aif", "aiff", "mka", "mkv", "webm", "avi", "ts", "mpg", "opus", "m4b", "oga", "mpeg", "m4v", "flv", "wmv", "rm", "rmvb", "3gp", "dsf"}
+-	}
+-
+-	// 重建 Scanner
+-	newScanConfig := &services.ScanConfig{
+-		MusicPath:        musicPathConfig.Path,
+-		ExcludeDirs:      musicPathConfig.ExcludeDirs,
+-		ExcludePaths:     musicPathConfig.ExcludePaths,
+-		SupportedFormats: scanConfigData.SupportedFormats,
+-	}
+-	a.scanner = services.NewScanner(newScanConfig)
+-
+-	// 更新 ScanHandler 中的 Scanner 引用
+-	scanHandler.SetScanner(a.scanner)
+-
+-	// 更新 SongService 中的 Scanner 引用
+-	a.songService.SetScanner(a.scanner)
+-
+-	// 更新 MetadataExtractor 的 TitleSource 配置
+-	a.metadataExtractor.SetTitleSource(a.configService.GetString("scan_title_source", "tag"))
+-
+-	slog.Info("配置变更回调：Scanner 已重建",
+-		"musicPath", musicPathConfig.Path,
+-		"excludeDirs", musicPathConfig.ExcludeDirs,
+-		"excludePaths", musicPathConfig.ExcludePaths,
+-	)
+-
+-	// 异步清理排除目录中的歌曲
+-	go func() {
+-		result, err := a.songService.CleanInvalidSongs(context.Background())
+-		if err != nil {
+-			slog.Error("配置变更回调：清理无效歌曲失败", "error", err)
+-			return
+-		}
+-		if result.Total > 0 {
+-			slog.Info("配置变更回调：清理无效歌曲完成",
+-				"total", result.Total,
+-				"fileNotFound", result.FileNotFound,
+-				"inExcludedDir", result.InExcludedDir,
+-			)
+-		}
+-	}()
+-}
+-
+ // BuildHandler 构建 HTTP Handler（含 BasePath 处理），供外部自行绑定 http.Server
+ func (a *App) BuildHandler() http.Handler {
+ 	var handler http.Handler = a.router
+diff --git a/internal/app/routers.go b/internal/app/routers.go
+index 6a33a9a..cdff4bc 100644
+--- a/internal/app/routers.go
++++ b/internal/app/routers.go
+@@ -1,6 +1,8 @@
+ package app
+ 
+ import (
++	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"net/http"
+ 	"path/filepath"
+@@ -47,7 +49,14 @@ func (a *App) setupAPIV1Router() {
+ 		hlsHandler,
+ 		a.playActivity,
+ 	)
+-	songHandler.SetGetMusicPath(a.scanner.GetMusicPath)
++	// 用闭包读取「当前已发布」的扫描器，不能直接传 a.scanner.GetMusicPath 方法值——
++	// 方法值在启动时绑定旧 Scanner，配置发布重建后 SongHandler 会一直读到旧音乐根目录。
++	songHandler.SetGetMusicPath(func() string {
++		if sc := a.songService.Scanner(); sc != nil {
++			return sc.GetMusicPath()
++		}
++		return ""
++	})
+ 	songHandler.SetPlayBroadcaster(&playEventBroadcastAdapter{m: a.jsPluginManager})
+ 	songHandler.SetLyricSearcher(a.jsPluginManager)
+ 	songHandler.SetCoverSearcher(a.jsPluginManager)
+@@ -68,18 +77,36 @@ func (a *App) setupAPIV1Router() {
+ 	scanHandler.SetFingerprintService(fingerprintService)
+ 	a.songService.SetFingerprintService(fingerprintService)
+ 
+-	// music_path 写后回调：重建 Scanner 并清理排除目录中的歌曲。
+-	// 两条入口都触发同一副作用，保持 admin /configs PUT 与业务 /settings/music-path PUT 行为对齐。
+-	musicPathChanged := func() { a.onMusicPathConfigChanged(scanHandler) }
+-	scanHandler.SetOnMusicPathChanged(musicPathChanged)
++	// music_path 的两条写入口（业务端点 /settings/music-path 与 admin /configs PUT）
++	// 统一走同步「配置发布」：停旧扫描 → 新规则清理曲库 → 落库新一代配置 → 原子切换
++	// Scanner，全部成功后接口才返回成功。handler 侧的 scanner 引用在 afterSwap 中刷新。
++	publishMusicPath := func(ctx context.Context, cfg services.MusicPathConfig) (uint64, error) {
++		return a.songService.PublishMusicPath(ctx, cfg, func(sc *services.Scanner) {
++			scanHandler.SetScanner(sc)
++		})
++	}
++	scanHandler.SetMusicPathPublisher(publishMusicPath)
++	scanHandler.SetOnScanTitleSourceChanged(func() {
++		a.metadataExtractor.SetTitleSource(a.configService.GetString("scan_title_source", "tag"))
++	})
+ 	scanHandler.SetOnAutoScanChanged(func(cfg services.AutoScanConfig) {
+ 		a.autoScanner.ApplyConfig(cfg)
+ 	})
++	// admin 通用入口直改 music_path 时，拦截默认落库，改走同一发布流程；
++	// 其余 key（如 auto_scan）维持落库后异步回调。
++	configHandler.SetBeforeConfigChange(func(key, value string) (bool, error) {
++		if key != "music_path" {
++			return false, nil
++		}
++		var cfg services.MusicPathConfig
++		if err := json.Unmarshal([]byte(value), &cfg); err != nil {
++			return true, fmt.Errorf("music_path 配置 JSON 解析失败: %w", err)
++		}
++		_, err := publishMusicPath(context.Background(), cfg)
++		return true, err
++	})
+ 	configHandler.SetOnConfigChanged(func(key string) {
+-		switch key {
+-		case "music_path":
+-			musicPathChanged()
+-		case "auto_scan":
++		if key == "auto_scan" {
+ 			cfg := a.autoScanner.GetConfig()
+ 			a.autoScanner.ApplyConfig(cfg)
+ 		}
+diff --git a/internal/handlers/config.go b/internal/handlers/config.go
+index 6bd4ada..e552071 100644
+--- a/internal/handlers/config.go
++++ b/internal/handlers/config.go
+@@ -15,7 +15,11 @@ import (
+ type ConfigHandler struct {
+ 	configService   *services.ConfigService
+ 	pluginRepo      tabConfigPluginSource // 插件安装状态（tab-config 的孤儿清理与限额统计用）
+-	onConfigChanged func(key string)      // 配置变更回调（可选）
++	onConfigChanged func(key string)      // 配置变更回调（可选，落库后异步触发）
++	// beforeConfigChange 落库前拦截（可选）：返回 handled=true 表示该 key 由钩子以
++	// 自定义语义完成「落库 + 副作用」（如 music_path 的配置发布边界），handler 跳过
++	// 默认落库与 onConfigChanged；err 非零时按 500 返回，配置不发生变更。
++	beforeConfigChange func(key, value string) (handled bool, err error)
+ }
+ 
+ // NewConfigHandler 创建配置处理器
+@@ -31,6 +35,11 @@ func (h *ConfigHandler) SetOnConfigChanged(callback func(key string)) {
+ 	h.onConfigChanged = callback
+ }
+ 
++// SetBeforeConfigChange 设置落库前拦截钩子（见 beforeConfigChange 字段说明）。
++func (h *ConfigHandler) SetBeforeConfigChange(hook func(key, value string) (bool, error)) {
++	h.beforeConfigChange = hook
++}
++
+ // ListConfigs 获取配置列表
+ // @Summary 获取配置列表
+ // @Description 获取配置列表，支持关键词搜索和分页
+@@ -197,6 +206,20 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// 落库前拦截：music_path 等需要发布边界语义的 key 由钩子同步完成
++	// 「停旧扫描 → 清理 → 落库 → 换 Scanner」，成功或失败都在此处对客户端可观察。
++	if h.beforeConfigChange != nil {
++		handled, hookErr := h.beforeConfigChange(key, req.Value)
++		if hookErr != nil {
++			respondError(w, http.StatusInternalServerError, "应用配置失败，已保留旧配置", hookErr)
++			return
++		}
++		if handled {
++			respondJSON(w, http.StatusOK, &models.Config{Key: key, Value: req.Value})
++			return
++		}
++	}
++
+ 	// 更新配置
+ 	config := &models.Config{
+ 		Key:   key,
+diff --git a/internal/handlers/scan.go b/internal/handlers/scan.go
+index 4cadde7..7a95a2b 100644
+--- a/internal/handlers/scan.go
++++ b/internal/handlers/scan.go
+@@ -21,8 +21,11 @@ type ScanHandler struct {
+ 	scanner            *services.Scanner
+ 	configService      *services.ConfigService
+ 	fingerprintService *services.FingerprintService
+-	onMusicPathChanged func()                        // PUT /settings/music-path 完成后触发，重建 Scanner 等副作用
+-	onAutoScanChanged  func(services.AutoScanConfig) // PUT /settings/auto-scan 完成后触发，重启自动扫描调度
++	// onPublishMusicPath 以发布边界语义同步应用音乐目录/排除配置：停旧扫描 → 清理 →
++	// 落库 → 换 Scanner，全部成功后才允许返回成功响应；返回新代际号。
++	onPublishMusicPath       func(ctx context.Context, cfg services.MusicPathConfig) (uint64, error)
++	onScanTitleSourceChanged func()                        // PUT /settings/scan-title-source 完成后触发，刷新标题来源
++	onAutoScanChanged        func(services.AutoScanConfig) // PUT /settings/auto-scan 完成后触发，重启自动扫描调度
+ }
+ 
+ // NewScanHandler 创建扫描处理器。configService 可为 nil（仅纯扫描端点的测试场景）。
+@@ -44,11 +47,18 @@ func (h *ScanHandler) SetScanner(scanner *services.Scanner) {
+ 	h.scanner = scanner
+ }
+ 
+-// SetOnMusicPathChanged 注入 music_path 写后回调（重建 Scanner + 清排除目录中的歌曲）。
+-// 同一回调也注册到通用 /configs/{key} 的 onConfigChanged，让 admin 工具直改 music_path 时
+-// 副作用同样生效（保持两条入口语义对齐）。
+-func (h *ScanHandler) SetOnMusicPathChanged(cb func()) {
+-	h.onMusicPathChanged = cb
++// SetMusicPathPublisher 注入 music_path 同步发布回调。
++// 回调必须以发布边界语义完成「停旧扫描 → 新规则清理 → 落库 → 换 Scanner」，
++// 任一环节失败都返回错误（接口据此给出可观察的失败）。
++// 通用 PUT /configs/music_path 也走同一发布流程，两条入口语义保持一致。
++func (h *ScanHandler) SetMusicPathPublisher(cb func(ctx context.Context, cfg services.MusicPathConfig) (uint64, error)) {
++	h.onPublishMusicPath = cb
++}
++
++// SetOnScanTitleSourceChanged 注入 scan_title_source 写后回调（仅刷新标题来源，
++// 不触发扫描停止/曲库清理）。
++func (h *ScanHandler) SetOnScanTitleSourceChanged(cb func()) {
++	h.onScanTitleSourceChanged = cb
+ }
+ 
+ // SetOnAutoScanChanged 注入 auto_scan 写后回调（重启自动扫描调度器）。
+@@ -288,11 +298,13 @@ const (
+ 
+ // MusicPathSetting /settings/music-path 的请求与响应体。
+ // 与 config 表 music_path 行的 JSON value 结构完全一致，便于 admin 工具与业务端点互通。
++// Generation 仅在响应中返回（服务端发布时分配）；请求体中携带会被忽略。
+ type MusicPathSetting struct {
+ 	Path                  string   `json:"path"`
+ 	ExcludeDirs           []string `json:"exclude_dirs"`
+ 	ExcludePaths          []string `json:"exclude_paths"`
+ 	AutoCreateExcludeDirs []string `json:"auto_create_exclude_dirs"`
++	Generation            uint64   `json:"generation,omitempty"`
+ }
+ 
+ // GetMusicPathSetting GET /api/v1/settings/music-path
+@@ -324,21 +336,19 @@ func (h *ScanHandler) GetMusicPathSetting(w http.ResponseWriter, r *http.Request
+ 
+ // UpdateMusicPathSetting PUT /api/v1/settings/music-path
+ // @Summary 更新音乐路径与扫描排除配置
+-// @Description 写入 music_path 配置并触发 Scanner 重建 + 清理排除目录中的歌曲（与 admin /configs PUT 的副作用一致）。
++// @Description 以"配置发布边界"语义同步应用：成功响应返回前，使用旧配置的在跑手动/自动扫描必须停止接收新工作并完成收尾（旧结果不再写库、不建歌单、不触发指纹），随后按新规则清除已脱离音乐根目录或进入排除范围的记录（即使旧文件仍存在），最后持久化新一代配置并原子切换 Scanner。任一步骤失败都返回错误且旧配置继续完整可用，不会留下持久配置、内存扫描器与曲库不一致的中间状态；服务重启后也只恢复最后成功发布的那一代。
+ // @Tags 扫描管理
+ // @Accept json
+ // @Produce json
+ // @Param request body MusicPathSetting true "配置内容"
+ // @Success 200 {object} MusicPathSetting
+ // @Failure 400 {object} map[string]string "请求格式错误"
+-// @Failure 500 {object} map[string]string "保存配置失败"
++// @Failure 500 {object} map[string]string "停止旧扫描、清理曲库或保存配置失败（旧配置仍可用）"
+ // @Security BearerAuth
+ // @Router /settings/music-path [put]
+ func (h *ScanHandler) UpdateMusicPathSetting(w http.ResponseWriter, r *http.Request) {
+-	if h.configService == nil {
+-		respondError(w, http.StatusInternalServerError, "configService 未注入", nil)
+-		return
+-	}
++	// 请求格式/参数校验先行，保证错误响应与历史行为兼容（坏 JSON、空 path 一律 400），
++	// 不依赖发布器是否注入。
+ 	var req MusicPathSetting
+ 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+ 		respondError(w, http.StatusBadRequest, "请求格式错误", err)
+@@ -357,14 +367,28 @@ func (h *ScanHandler) UpdateMusicPathSetting(w http.ResponseWriter, r *http.Requ
+ 	if req.AutoCreateExcludeDirs == nil {
+ 		req.AutoCreateExcludeDirs = []string{}
+ 	}
+-	if err := h.configService.SetJSON(musicPathConfigKey, req); err != nil {
+-		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
++
++	if h.configService == nil {
++		respondError(w, http.StatusInternalServerError, "configService 未注入", nil)
++		return
++	}
++	if h.onPublishMusicPath == nil {
++		respondError(w, http.StatusInternalServerError, "配置发布器未注入", nil)
+ 		return
+ 	}
+-	// 副作用与通用 PUT /configs/music_path 完全一致（onConfigChanged 回调），异步触发不阻塞 PUT 响应。
+-	if h.onMusicPathChanged != nil {
+-		go h.onMusicPathChanged()
++	cfg := services.MusicPathConfig{
++		Path:                  req.Path,
++		ExcludeDirs:           req.ExcludeDirs,
++		ExcludePaths:          req.ExcludePaths,
++		AutoCreateExcludeDirs: req.AutoCreateExcludeDirs,
++	}
++	// 同步走完整个发布流程后才允许返回成功；失败时错误必须可观察。
++	generation, err := h.onPublishMusicPath(r.Context(), cfg)
++	if err != nil {
++		respondError(w, http.StatusInternalServerError, "应用扫描配置失败，已保留旧配置", err)
++		return
+ 	}
++	req.Generation = generation
+ 	respondJSON(w, http.StatusOK, req)
+ }
+ 
+@@ -588,8 +612,9 @@ func (h *ScanHandler) UpdateScanTitleSourceSetting(w http.ResponseWriter, r *htt
+ 		respondError(w, http.StatusInternalServerError, "保存配置失败", err)
+ 		return
+ 	}
+-	if h.onMusicPathChanged != nil {
+-		go h.onMusicPathChanged()
++	// 标题来源与音乐目录/排除规则无关：只刷新提取器配置，不触发停扫描/清曲库。
++	if h.onScanTitleSourceChanged != nil {
++		go h.onScanTitleSourceChanged()
+ 	}
+ 	respondJSON(w, http.StatusOK, scanTitleSourceRequest{TitleSource: req.TitleSource})
+ }
+diff --git a/internal/handlers/scan_settings_test.go b/internal/handlers/scan_settings_test.go
+index cc4494b..4f7adb2 100644
+--- a/internal/handlers/scan_settings_test.go
++++ b/internal/handlers/scan_settings_test.go
+@@ -1,13 +1,14 @@
+ package handlers
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"sync/atomic"
+ 	"testing"
+-	"time"
+ 
+ 	"songloft/internal/database/testutil"
+ 	"songloft/internal/services"
+@@ -43,19 +44,21 @@ func TestMusicPathSetting_GetDefault(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMusicPathSetting_UpdateThenReadAndCallback PUT 写入后 GET 读到最新值，
+-// 且 onMusicPathChanged 回调被异步触发（保证 Scanner 重建副作用）。
+-func TestMusicPathSetting_UpdateThenReadAndCallback(t *testing.T) {
++// TestMusicPathSetting_UpdateThenReadAndPublish PUT 必须同步走完发布器后才返回成功，
++// 响应携带新代际号，且 GET 能读到已发布的值。
++func TestMusicPathSetting_UpdateThenReadAndPublish(t *testing.T) {
+ 	h := newTestScanHandlerWithConfig(t)
+ 
+-	called := make(chan struct{}, 1)
+ 	var callCount atomic.Int32
+-	h.SetOnMusicPathChanged(func() {
++	var published services.MusicPathConfig
++	h.SetMusicPathPublisher(func(_ context.Context, cfg services.MusicPathConfig) (uint64, error) {
+ 		callCount.Add(1)
+-		select {
+-		case called <- struct{}{}:
+-		default:
++		published = cfg
++		// 发布器语义上负责持久化；这里同步写入，验证 GET 读回路径。
++		if err := h.configService.SetJSON("music_path", cfg); err != nil {
++			return 0, err
+ 		}
++		return 7, nil
+ 	})
+ 
+ 	body := `{"path":"/data/music","exclude_dirs":["tmp",".cache"],"exclude_paths":["/data/music/old"]}`
+@@ -65,15 +68,18 @@ func TestMusicPathSetting_UpdateThenReadAndCallback(t *testing.T) {
+ 	if rr.Code != http.StatusOK {
+ 		t.Fatalf("PUT status: got %d want 200, body=%s", rr.Code, rr.Body.String())
+ 	}
+-
+-	// 等回调（异步）
+-	select {
+-	case <-called:
+-	case <-time.After(time.Second):
+-		t.Fatal("onMusicPathChanged callback should fire after PUT")
+-	}
+ 	if callCount.Load() != 1 {
+-		t.Errorf("callback should fire exactly once, got %d", callCount.Load())
++		t.Fatalf("publisher should fire exactly once, got %d", callCount.Load())
++	}
++	if published.Path != "/data/music" || len(published.ExcludeDirs) != 2 || len(published.ExcludePaths) != 1 {
++		t.Errorf("published payload mismatch: %+v", published)
++	}
++	var resp MusicPathSetting
++	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
++		t.Fatalf("decode response: %v", err)
++	}
++	if resp.Generation != 7 {
++		t.Errorf("response generation: got %d want 7", resp.Generation)
+ 	}
+ 
+ 	// GET 读到最新值
+@@ -84,7 +90,34 @@ func TestMusicPathSetting_UpdateThenReadAndCallback(t *testing.T) {
+ 		t.Fatalf("decode: %v", err)
+ 	}
+ 	if got.Path != "/data/music" || len(got.ExcludeDirs) != 2 || len(got.ExcludePaths) != 1 {
+-		t.Errorf("read-after-write mismatch: %+v", got)
++		t.Errorf("read-after-publish mismatch: %+v", got)
++	}
++}
++
++// TestMusicPathSetting_PublishFailureObservable 发布器返回错误时接口必须给出可观察的
++// 失败（500），不能假装成功。
++func TestMusicPathSetting_PublishFailureObservable(t *testing.T) {
++	h := newTestScanHandlerWithConfig(t)
++	h.SetMusicPathPublisher(func(_ context.Context, _ services.MusicPathConfig) (uint64, error) {
++		return 0, errors.New("cleanup failed")
++	})
++
++	rr := httptest.NewRecorder()
++	h.UpdateMusicPathSetting(rr, httptest.NewRequest("PUT", "/api/v1/settings/music-path",
++		strings.NewReader(`{"path":"/data/music"}`)))
++	if rr.Code != http.StatusInternalServerError {
++		t.Fatalf("publish failure: got %d want 500, body=%s", rr.Code, rr.Body.String())
++	}
++}
++
++// TestMusicPathSetting_NoPublisher PUT 未注入发布器时返回 500 而非静默成功。
++func TestMusicPathSetting_NoPublisher(t *testing.T) {
++	h := newTestScanHandlerWithConfig(t)
++	rr := httptest.NewRecorder()
++	h.UpdateMusicPathSetting(rr, httptest.NewRequest("PUT", "/api/v1/settings/music-path",
++		strings.NewReader(`{"path":"/data/music"}`)))
++	if rr.Code != http.StatusInternalServerError {
++		t.Fatalf("missing publisher: got %d want 500", rr.Code)
+ 	}
+ }
+ 
+diff --git a/internal/services/scan_dsf_test.go b/internal/services/scan_dsf_test.go
+index bad6a3e..c32ff16 100644
+--- a/internal/services/scan_dsf_test.go
++++ b/internal/services/scan_dsf_test.go
+@@ -40,7 +40,8 @@ func TestScanAndImportDSFWithDefaultConfig(t *testing.T) {
+ 	scanner := NewScanner(&ScanConfig{MusicPath: root, SupportedFormats: scanConfig.SupportedFormats})
+ 	extractor := NewMetadataExtractor(&MetadataConfig{FFProbePath: "ffprobe", CoverStoragePath: t.TempDir()})
+ 	service := NewSongService(db.SongRepository(), db, extractor, scanner, nil, nil)
+-	service.doScanAndImport(context.Background(), false, nil)
++	run := newDirectScanRun(t, scanner)
++	service.doScanAndImport(run, false, nil)
+ 	songs, err := db.SongRepository().List(context.Background(), &database.SongFilter{Type: models.TypeLocal})
+ 	if err != nil {
+ 		t.Fatal(err)
+diff --git a/internal/services/scan_progress.go b/internal/services/scan_progress.go
+index efe4455..4f1b33e 100644
+--- a/internal/services/scan_progress.go
++++ b/internal/services/scan_progress.go
+@@ -242,6 +242,27 @@ func (m *ScanProgressManager) SetCancelled() {
+ 	m.progress.CurrentFile = ""
+ }
+ 
++// SetStoppedExternally 终态化一个被「配置发布」协调停止的扫描。
++//
++// 状态语义沿用 cancelled（前端轮询、Start 放行规则都兼容），区别只是取消通道
++// 也要在这里关闭并置 nil：这种停止不经过 Cancel()（那是用户取消入口），
++// 若只置状态不关通道，会留下一个无人引用却永远开着的取消通道。
++// 调用方必须保证该扫描的全部收尾（goroutine 退出、结果不再写库）已完成或即将完成。
++func (m *ScanProgressManager) SetStoppedExternally() {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++
++	now := time.Now()
++	m.progress.Status = ScanStatusCancelled
++	m.progress.EndTime = &now
++	m.progress.CurrentFile = ""
++
++	if m.cancel != nil {
++		close(m.cancel)
++		m.cancel = nil
++	}
++}
++
+ // GetCancelChannel 获取取消通道
+ func (m *ScanProgressManager) GetCancelChannel() <-chan struct{} {
+ 	m.mu.RLock()
+diff --git a/internal/services/scan_publish.go b/internal/services/scan_publish.go
+new file mode 100644
+index 0000000..2597534
+--- /dev/null
++++ b/internal/services/scan_publish.go
+@@ -0,0 +1,296 @@
++package services
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"sync/atomic"
++
++	"songloft/internal/database"
++	"songloft/internal/models"
++)
++
++// 扫描相关 config key。handlers 层的同名常量保留为对这里的引用，
++// 避免「业务端点」与「发布流程」各自拼写字符串造成漂移。
++const (
++	musicPathConfigKey       = "music_path"
++	scanTitleSourceConfigKey = "scan_title_source"
++)
++
++// scanStopReason 描述扫描为什么被要求停止。
++type scanStopReason int
++
++const (
++	scanStopNone   scanStopReason = iota // 未收到停止信号
++	scanStopUser                         // 用户经 /scan/cancel 取消：保留已提取成果
++	scanStopSwitch                       // 配置发布要求旧代扫描收尾：旧结果一律不得越过发布边界
++)
++
++// scanRun 是一次扫描任务的运行时句柄，也是配置发布的协调单元（fence）。
++//
++// 生命周期：ScanAndImportAsync 创建并登记为 activeRun，goroutine 退出时注销。
++// 发布流程（PublishMusicPath）通过 activeRun 找到在跑的旧代扫描，关闭 switchCh
++// 并等待 done，保证成功响应返回前旧扫描已经停止接收新工作并完全收尾。
++type scanRun struct {
++	generation uint64   // 启动时捕获的配置代际
++	scanner    *Scanner // 启动时捕获的扫描器，运行期不回读当前 binding
++
++	// userCancel 复用 ScanProgressManager 的用户取消通道（可能随 Complete/Fail 被置 nil，
++	// 这里持有启动时的那份引用）。
++	userCancel <-chan struct{}
++	// switchCh 由配置发布关闭：旧代扫描即刻停止接收新工作，已发现/已提取/待提交/
++	// CUE 处理中的旧结果全部丢弃，不再执行歌单与指纹等任何后置副作用。
++	switchCh chan struct{}
++
++	ctx      context.Context // userCancel 或 switchCh 任一触发都会被取消（用于杀 ffprobe 子进程）
++	cancelFn context.CancelFunc
++	done     chan struct{} // goroutine 退出时关闭，发布方据此 join
++
++	// abandoned 发布边界落下前置位；flushScanBatch / processCueSheet / 自动歌单 /
++	// 自动指纹等所有写库收口点在动手前复核它，是「旧结果不能越过边界」的第二道防线。
++	abandoned atomic.Bool
++}
++
++// stopReason 非阻塞判断当前停止原因。配置发布优先于用户取消：发布进行中
++// 即便用户同时点了取消，也必须按「丢弃旧结果」收尾，否则边界会被旧写入穿透。
++func (r *scanRun) stopReason() scanStopReason {
++	select {
++	case <-r.switchCh:
++		return scanStopSwitch
++	default:
++	}
++	select {
++	case <-r.userCancel:
++		return scanStopUser
++	default:
++	}
++	return scanStopNone
++}
++
++// switched 判断发布边界是否已落下。
++func (r *scanRun) switched() bool {
++	select {
++	case <-r.switchCh:
++		return true
++	default:
++	}
++	return false
++}
++
++// terminalize 按停止原因把进度推进终态。返回 true 表示调用方应当立刻结束扫描。
++func (s *SongService) terminalizeIfStopped(run *scanRun) bool {
++	switch run.stopReason() {
++	case scanStopSwitch:
++		s.scanProgressManager.SetStoppedExternally()
++		return true
++	case scanStopUser:
++		s.scanProgressManager.SetCancelled()
++		return true
++	default:
++		return false
++	}
++}
++
++// MusicPathConfig 是音乐目录与排除规则的发布载荷。
++// JSON 形态与 config 表 music_path 行、/settings/music-path 接口体保持互通。
++type MusicPathConfig struct {
++	Path                  string   `json:"path"`
++	ExcludeDirs           []string `json:"exclude_dirs"`
++	ExcludePaths          []string `json:"exclude_paths"`
++	AutoCreateExcludeDirs []string `json:"auto_create_exclude_dirs"`
++	// Generation 由服务端在发布成功时写入，外部请求携带的值一律忽略。
++	// 重启后仅凭这一行就能恢复「最后成功发布的那一代」。
++	Generation uint64 `json:"generation,omitempty"`
++}
++
++// PublishMusicPath 以「发布边界」语义应用新一代音乐目录/排除配置。
++//
++// 成功返回（= 配置更新成功响应可以发出）前，按顺序保证：
++//  1. 关闭启动闸门，手动/自动扫描不再接收新工作；
++//  2. 旧配置的在跑扫描被要求停止并 join 完成：旧结果（发现/提取/待批量提交/CUE 处理中）
++//     一律丢弃，不再更新进度、不建歌单、不启动指纹；旧扫描尾部启动的指纹任务也被收尾；
++//  3. 按新规则清理曲库：删除不再位于新音乐根目录、或落入新排除范围的记录
++//     （含 CUE 来源组），即使旧文件仍真实存在；
++//  4. 持久化新一代配置（提交点）并原子替换内存 Scanner，执行 afterSwap 接线。
++//
++// 失败语义：步骤 2/3 失败时不落库、不换 Scanner，旧配置继续完整可用；
++// 步骤 4 失败时内存仍保留旧配置，已清理的行会在旧配置下一次扫描时按磁盘文件恢复。
++// 进程在提交点前后崩溃，重启都只会恢复已成功发布的那一代（提交前=旧代，提交后=新代，
++// 曲库清理发生在提交之前）。
++//
++// afterSwap 在新 Scanner 原子生效后同步调用（仅用于刷新 handler 引用等内存接线，
++// 不应返回错误、不应做重活）。返回值为新一代代际号。
++func (s *SongService) PublishMusicPath(ctx context.Context, req MusicPathConfig, afterSwap func(*Scanner)) (uint64, error) {
++	if s.configService == nil {
++		return 0, fmt.Errorf("configService 未注入，无法发布扫描配置")
++	}
++	// 通用 /configs 入口可能只提交部分字段（nil 切片），统一规范化为空数组，
++	// 保证持久化的 JSON 形态确定、Scanner 排除规则与 GET 响应稳定。
++	if req.ExcludeDirs == nil {
++		req.ExcludeDirs = []string{}
++	}
++	if req.ExcludePaths == nil {
++		req.ExcludePaths = []string{}
++	}
++	if req.AutoCreateExcludeDirs == nil {
++		req.AutoCreateExcludeDirs = []string{}
++	}
++
++	// 整个发布流程串行化，避免两次切换交错留下中间状态。
++	s.publishMu.Lock()
++	defer s.publishMu.Unlock()
++
++	formats, err := s.loadSupportedFormats()
++	if err != nil {
++		return 0, err
++	}
++	newScanner := NewScanner(&ScanConfig{
++		MusicPath:        req.Path,
++		ExcludeDirs:      req.ExcludeDirs,
++		ExcludePaths:     req.ExcludePaths,
++		SupportedFormats: formats,
++	})
++
++	// 关闸 + 抓取活动扫描必须与扫描注册互斥：关闸后不可能再有新 run 登记。
++	// 锁序固定为 startMu → scanRegMu，与 ScanAndImportAsync 的注册路径一致。
++	s.startMu.Lock()
++	s.publishing.Store(true)
++	s.scanRegMu.Lock()
++	run := s.activeRun
++	s.scanRegMu.Unlock()
++	s.startMu.Unlock()
++	defer s.publishing.Store(false)
++
++	// 停止旧代扫描并等待其完全收尾（ctx 可被 HTTP 请求取消打断等待）。
++	if run != nil {
++		slog.Info("配置发布：停止在跑的旧配置扫描", "oldGeneration", run.generation)
++		close(run.switchCh)
++		run.abandoned.Store(true)
++		run.cancelFn()
++		select {
++		case <-run.done:
++		case <-ctx.Done():
++			return 0, fmt.Errorf("等待旧扫描收尾被中断: %w", ctx.Err())
++		}
++	}
++
++	// 旧扫描尾部可能已异步启动指纹计算（runAutoFingerprint 启动后即与扫描 goroutine
++	// 脱钩），同样属于旧配置任务，发布前必须停掉并等其退出。
++	if fs := s.fingerprintService.Load(); fs != nil {
++		if fs.Cancel() {
++			slog.Info("配置发布：已停止旧扫描启动的指纹计算")
++		}
++	}
++
++	// 按新规则清理曲库。此时已无任何旧代写入者，清理结果不会被旧批次「复活」。
++	cleaned, err := s.cleanSongsForConfig(ctx, newScanner)
++	if err != nil {
++		slog.Error("配置发布：按新规则清理曲库失败，保留旧配置", "error", err)
++		return 0, fmt.Errorf("按新规则清理曲库失败: %w", err)
++	}
++	if cleaned > 0 {
++		slog.Info("配置发布：已清除不属于新配置的记录", "cleaned", cleaned)
++	}
++
++	// 提交点：持久化新一代配置。此行成功前崩溃/失败，重启恢复的仍是旧代。
++	old := s.binding.Load()
++	nextGeneration := uint64(1)
++	if old != nil {
++		nextGeneration = old.generation + 1
++	}
++	persisted := MusicPathConfig{
++		Path:                  req.Path,
++		ExcludeDirs:           req.ExcludeDirs,
++		ExcludePaths:          req.ExcludePaths,
++		AutoCreateExcludeDirs: req.AutoCreateExcludeDirs,
++		Generation:            nextGeneration,
++	}
++	if err := s.configService.SetJSON(musicPathConfigKey, persisted); err != nil {
++		slog.Error("配置发布：持久化新配置失败，保留旧配置", "error", err)
++		return 0, fmt.Errorf("持久化扫描配置失败: %w", err)
++	}
++
++	// 内存 Scanner 与代际原子生效；此后新发起的手动/自动扫描统一使用新规则。
++	s.binding.Store(&scannerBinding{scanner: newScanner, generation: nextGeneration})
++	if s.metadataExtractor != nil {
++		s.metadataExtractor.SetTitleSource(s.configService.GetString(scanTitleSourceConfigKey, "tag"))
++	}
++	if afterSwap != nil {
++		afterSwap(newScanner)
++	}
++	slog.Info("配置发布完成",
++		"generation", nextGeneration,
++		"musicPath", req.Path,
++		"excludeDirs", req.ExcludeDirs,
++		"excludePaths", req.ExcludePaths,
++		"cleaned", cleaned,
++	)
++	return nextGeneration, nil
++}
++
++// loadSupportedFormats 读取 scan_config 支持的音频格式；未配置时使用内置全量默认列表。
++func (s *SongService) loadSupportedFormats() ([]string, error) {
++	if s.configService == nil {
++		return nil, fmt.Errorf("configService 未注入")
++	}
++	var scanConfigData struct {
++		SupportedFormats []string `json:"supported_formats"`
++	}
++	if err := s.configService.GetJSON("scan_config", &scanConfigData); err != nil || len(scanConfigData.SupportedFormats) == 0 {
++		return []string{"mp3", "flac", "wav", "ape", "ogg", "m4a", "mp4", "mov", "wma", "aif", "aiff", "mka", "mkv", "webm", "avi", "ts", "mpg", "opus", "m4b", "oga", "mpeg", "m4v", "flv", "wmv", "rm", "rmvb", "3gp", "dsf"}, nil
++	}
++	return scanConfigData.SupportedFormats, nil
++}
++
++// cleanSongsForConfig 按「新配置」清理曲库：删除不属于新 Scanner 的本地歌曲记录。
++//
++// 与 CleanInvalidSongs 的差异：
++//   - 不要求文件已从磁盘消失——根目录改走或新增排除规则时旧文件仍真实存在，记录也要清除；
++//   - 同时清理 CUE 来源组：CUE 源或其引用音频脱离新根目录/进入排除区时整组删除；
++//   - 不删除磁盘文件（deleteFiles 恒为 false）。
++//
++// 必须在无旧代写入者（旧扫描已 join）时调用，返回清理的记录数。
++func (s *SongService) cleanSongsForConfig(ctx context.Context, newScanner *Scanner) (int, error) {
++	songs, err := s.songs.List(ctx, &database.SongFilter{
++		Type:  models.TypeLocal,
++		Limit: models.MaxPaginationLimit,
++	})
++	if err != nil {
++		return 0, fmt.Errorf("查询本地歌曲失败: %w", err)
++	}
++
++	var staleIDs []int64
++	badCueSources := make(map[string]struct{})
++	for _, song := range songs {
++		if song.CueSourcePath != "" {
++			if !newScanner.OwnsPath(song.CueSourcePath) ||
++				(song.CueAudioPath != "" && !newScanner.OwnsPath(song.CueAudioPath)) {
++				badCueSources[song.CueSourcePath] = struct{}{}
++			}
++			continue
++		}
++		if !newScanner.OwnsPath(song.FilePath) {
++			staleIDs = append(staleIDs, song.ID)
++		}
++	}
++
++	cleaned := 0
++	if len(staleIDs) > 0 {
++		deleted, err := s.BatchDelete(ctx, staleIDs, false)
++		if err != nil {
++			return cleaned, fmt.Errorf("清理越界/排除歌曲失败: %w", err)
++		}
++		cleaned += deleted
++	}
++	for source := range badCueSources {
++		deleted, err := s.songs.DeleteByCueSource(ctx, source)
++		if err != nil {
++			return cleaned, fmt.Errorf("清理越界/排除 CUE 来源失败 %s: %w", source, err)
++		}
++		if deleted > 0 {
++			slog.Info("配置发布：清理 CUE 来源组", "source", source, "deleted", deleted)
++		}
++		cleaned += deleted
++	}
++	return cleaned, nil
++}
+diff --git a/internal/services/scan_publish_test.go b/internal/services/scan_publish_test.go
+new file mode 100644
+index 0000000..ca80805
+--- /dev/null
++++ b/internal/services/scan_publish_test.go
+@@ -0,0 +1,412 @@
++package services
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"songloft/internal/database"
++	"songloft/internal/database/testutil"
++	"songloft/internal/models"
++)
++
++// waitScanTerminal 轮询扫描进度直到进入终态或超时，返回最终进度。
++func waitScanTerminal(t *testing.T, svc *SongService) ScanProgress {
++	t.Helper()
++	deadline := time.Now().Add(30 * time.Second)
++	for time.Now().Before(deadline) {
++		p := svc.GetScanProgress()
++		switch p.Status {
++		case ScanStatusCompleted, ScanStatusFailed, ScanStatusCancelled:
++			return p
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	p := svc.GetScanProgress()
++	t.Fatalf("扫描未在超时时间内进入终态: %+v", p)
++	return p
++}
++
++// newPublishTestService 构造带真实内存 DB、ConfigService 与 tag 提取器的 SongService，
++// 初始 Scanner 指向 initialRoot。返回 DB 与 service。
++func newPublishTestService(t *testing.T, initialRoot string) (*database.SQLiteDB, *SongService) {
++	t.Helper()
++	mdb := testutil.OpenMemoryDB(t)
++	cfgSvc := NewConfigService(mdb.ConfigRepository())
++	if err := cfgSvc.SetJSON(musicPathConfigKey, MusicPathConfig{
++		Path:        initialRoot,
++		ExcludeDirs: []string{},
++		ExcludePaths: []string{},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	scanner := NewScanner(&ScanConfig{MusicPath: initialRoot, SupportedFormats: []string{"flac"}})
++	extractor := NewMetadataExtractor(&MetadataConfig{FFProbePath: "ffprobe", CoverStoragePath: t.TempDir()})
++	svc := NewSongService(mdb.SongRepository(), mdb, extractor, scanner, cfgSvc, nil)
++	return mdb, svc
++}
++
++// seedFlac 把测试 FLAC 样本复制为 dst（mtime 拨到 1 分钟前避开写入稳定性窗口）。
++func seedFlac(t *testing.T, dst string) {
++	t.Helper()
++	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
++		t.Fatal(err)
++	}
++	sample, err := os.ReadFile(filepath.Join("..", "..", "pkg", "tag", "testdata", "with_tags", "sample.flac"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(dst, sample, 0644); err != nil {
++		t.Fatal(err)
++	}
++	old := time.Now().Add(-time.Minute)
++	if err := os.Chtimes(dst, old, old); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func localSongPaths(t *testing.T, mdb *database.SQLiteDB) map[string]bool {
++	t.Helper()
++	paths, err := mdb.SongRepository().ListLocalPaths(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	out := make(map[string]bool, len(paths))
++	for p := range paths {
++		out[p] = true
++	}
++	return out
++}
++
++// TestPublishMusicPath_SwapsAndCleansOutsideRoot 发布新音乐根目录：
++// 旧根目录下的记录即使文件仍存在也必须清除；内存 Scanner、代际、持久化配置一致切换；
++// 重启模拟后只恢复新一代配置，新扫描不会把旧根歌曲带回来。
++func TestPublishMusicPath_SwapsAndCleansOutsideRoot(t *testing.T) {
++	rootA := filepath.Join(t.TempDir(), "musicA")
++	rootB := filepath.Join(t.TempDir(), "musicB")
++	songA := filepath.Join(rootA, "a.flac")
++	songB := filepath.Join(rootB, "b.flac")
++	seedFlac(t, songA)
++	seedFlac(t, songB)
++
++	mdb, svc := newPublishTestService(t, rootA)
++
++	if err := svc.ScanAndImportAsync(false, nil); err != nil {
++		t.Fatal(err)
++	}
++	if p := waitScanTerminal(t, svc); p.Status != ScanStatusCompleted {
++		t.Fatalf("初始扫描状态: %+v", p)
++	}
++	if !localSongPaths(t, mdb)[songA] {
++		t.Fatalf("初始扫描应导入旧根目录歌曲 %s", songA)
++	}
++
++	gen, err := svc.PublishMusicPath(context.Background(), MusicPathConfig{Path: rootB}, nil)
++	if err != nil {
++		t.Fatalf("PublishMusicPath: %v", err)
++	}
++	if gen != 1 {
++		t.Errorf("首次发布代际: got %d want 1", gen)
++	}
++	if svc.ScanGeneration() != 1 || svc.Scanner().GetMusicPath() != rootB {
++		t.Errorf("内存 binding 未切换: gen=%d root=%q", svc.ScanGeneration(), svc.Scanner().GetMusicPath())
++	}
++	// 发布只负责清除「不属于新配置」的记录，不会替新根目录做导入（b.flac 尚不在库中）。
++	paths := localSongPaths(t, mdb)
++	if paths[songA] {
++		t.Errorf("旧根目录歌曲在发布后仍存在（文件真实存在也应清除）: %s", songA)
++	}
++	if paths[songB] {
++		t.Errorf("新根目录尚未扫描，不应提前出现记录: %s", songB)
++	}
++
++	var persisted MusicPathConfig
++	if err := svc.configService.GetJSON(musicPathConfigKey, &persisted); err != nil {
++		t.Fatal(err)
++	}
++	if persisted.Path != rootB || persisted.Generation != 1 {
++		t.Fatalf("持久化的不是成功发布的那一代: %+v", persisted)
++	}
++
++	// 模拟服务重启：从持久化配置重建 Scanner，再扫一次，旧根歌曲不得复活。
++	restartScanner := NewScanner(&ScanConfig{MusicPath: persisted.Path, SupportedFormats: []string{"flac"}})
++	svc2 := NewSongService(mdb.SongRepository(), mdb, svc.metadataExtractor, restartScanner, svc.configService, nil)
++	if err := svc2.ScanAndImportAsync(false, nil); err != nil {
++		t.Fatal(err)
++	}
++	if p := waitScanTerminal(t, svc2); p.Status != ScanStatusCompleted {
++		t.Fatalf("重启后扫描状态: %+v", p)
++	}
++	paths = localSongPaths(t, mdb)
++	if paths[songA] {
++		t.Errorf("重启恢复新一代配置后，旧根目录歌曲被新扫描带回: %s", songA)
++	}
++	if !paths[songB] {
++		t.Errorf("新根目录歌曲在重启扫描后丢失: %s", songB)
++	}
++}
++
++// TestPublishMusicPath_ExcludeRuleOnly 仅调整排除规则：同根目录下新进入排除范围的
++// 记录必须清除，即使文件仍真实存在；其余记录保留。
++func TestPublishMusicPath_ExcludeRuleOnly(t *testing.T) {
++	root := t.TempDir()
++	keep := filepath.Join(root, "keep", "k.flac")
++	gone := filepath.Join(root, "secret", "s.flac")
++	seedFlac(t, keep)
++	seedFlac(t, gone)
++
++	mdb, svc := newPublishTestService(t, root)
++	if err := svc.ScanAndImportAsync(false, nil); err != nil {
++		t.Fatal(err)
++	}
++	if p := waitScanTerminal(t, svc); p.Status != ScanStatusCompleted {
++		t.Fatalf("扫描状态: %+v", p)
++	}
++
++	gen, err := svc.PublishMusicPath(context.Background(), MusicPathConfig{
++		Path:        root,
++		ExcludeDirs: []string{"secret"},
++	}, nil)
++	if err != nil {
++		t.Fatalf("PublishMusicPath: %v", err)
++	}
++	if gen != 1 {
++		t.Errorf("代际: got %d want 1", gen)
++	}
++	paths := localSongPaths(t, mdb)
++	if paths[gone] {
++		t.Errorf("进入排除范围的记录应被清除（文件仍存在）: %s", gone)
++	}
++	if !paths[keep] {
++		t.Errorf("排除范围外的记录不应被动到: %s", keep)
++	}
++}
++
++// TestPublishMusicPath_CueGroupsCleaned CUE 源脱离新根目录时整组记录必须清除。
++func TestPublishMusicPath_CueGroupsCleaned(t *testing.T) {
++	rootA := filepath.Join(t.TempDir(), "a")
++	rootB := filepath.Join(t.TempDir(), "b")
++	mdb, svc := newPublishTestService(t, rootA)
++	repo := mdb.SongRepository()
++	ctx := context.Background()
++
++	cueSrc := filepath.Join(rootA, "disc.flac")
++	for i := 1; i <= 3; i++ {
++		if err := repo.Create(ctx, &models.Song{
++			Type:          models.TypeLocal,
++			Title:         "cue track",
++			FilePath:      cueSrc,
++			CueSourcePath: cueSrc,
++			CueAudioPath:  cueSrc,
++			CueTrackIndex: i,
++			AddedAt:       time.Now(),
++			UpdatedAt:     time.Now(),
++		}); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	if _, err := svc.PublishMusicPath(ctx, MusicPathConfig{Path: rootB}, nil); err != nil {
++		t.Fatalf("PublishMusicPath: %v", err)
++	}
++	srcs, err := repo.ListCueSources(ctx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(srcs) != 0 {
++		t.Errorf("越界 CUE 来源组应被整组清除，剩余: %v", srcs)
++	}
++}
++
++// failingListRepo 包装真实仓储但让 List 恒失败，用于模拟发布清理阶段的 DB 故障。
++type failingListRepo struct {
++	SongRepository
++}
++
++func (f *failingListRepo) List(ctx context.Context, filter *database.SongFilter) ([]*models.Song, error) {
++	return nil, errors.New("simulated list failure")
++}
++
++// TestPublishMusicPath_CleanupFailureKeepsOldConfig 清理失败时接口报错，
++// 旧配置继续完整可用：内存 Scanner/代际不变、持久化配置仍是旧代、闸门释放后可正常扫描。
++func TestPublishMusicPath_CleanupFailureKeepsOldConfig(t *testing.T) {
++	rootA := filepath.Join(t.TempDir(), "a")
++	rootB := filepath.Join(t.TempDir(), "b")
++	if err := os.MkdirAll(rootA, 0755); err != nil {
++		t.Fatal(err)
++	}
++
++	mdb := testutil.OpenMemoryDB(t)
++	cfgSvc := NewConfigService(mdb.ConfigRepository())
++	if err := cfgSvc.SetJSON(musicPathConfigKey, MusicPathConfig{Path: rootA}); err != nil {
++		t.Fatal(err)
++	}
++	scannerA := NewScanner(&ScanConfig{MusicPath: rootA, SupportedFormats: []string{"flac"}})
++	extractor := NewMetadataExtractor(&MetadataConfig{FFProbePath: "ffprobe", CoverStoragePath: t.TempDir()})
++	svc := NewSongService(&failingListRepo{SongRepository: mdb.SongRepository()}, mdb, extractor, scannerA, cfgSvc, nil)
++
++	_, err := svc.PublishMusicPath(context.Background(), MusicPathConfig{Path: rootB}, nil)
++	if err == nil {
++		t.Fatal("清理失败时 PublishMusicPath 必须返回错误")
++	}
++	if svc.Scanner().GetMusicPath() != rootA || svc.ScanGeneration() != 0 {
++		t.Errorf("失败后内存 binding 应保持旧代: root=%q gen=%d", svc.Scanner().GetMusicPath(), svc.ScanGeneration())
++	}
++	// 清理发生在落库之前：失败时持久化配置必须仍是旧值。
++	var persisted MusicPathConfig
++	if err := cfgSvc.GetJSON(musicPathConfigKey, &persisted); err != nil {
++		t.Fatal(err)
++	}
++	if persisted.Path != rootA {
++		t.Errorf("失败后持久化配置应为旧根目录, got %q", persisted.Path)
++	}
++
++	// 闸门已释放：扫描入口恢复可用（空目录扫描应正常完成）。
++	svc2 := NewSongService(mdb.SongRepository(), mdb, extractor, scannerA, cfgSvc, nil)
++	if err := svc2.ScanAndImportAsync(false, nil); err != nil {
++		t.Fatalf("发布失败后扫描入口应恢复: %v", err)
++	}
++	if p := waitScanTerminal(t, svc2); p.Status != ScanStatusCompleted {
++		t.Fatalf("旧配置下扫描状态: %+v", p)
++	}
++}
++
++// blockingRun 模拟一个「正在跑、收到发布信号后才收尾」的旧扫描：
++// publisher 关闭 switchCh 后本协程才能解除阻塞并 close(done)。
++func registerBlockingRun(svc *SongService) (run *scanRun, observed chan struct{}, release chan struct{}) {
++	ctx, cancel := context.WithCancel(context.Background())
++	run = &scanRun{
++		generation: 0,
++		scanner:    svc.Scanner(),
++		switchCh:   make(chan struct{}),
++		done:       make(chan struct{}),
++		ctx:        ctx,
++		cancelFn:   cancel,
++	}
++	observed = make(chan struct{})
++	release = make(chan struct{})
++	svc.scanRegMu.Lock()
++	svc.activeRun = run
++	svc.scanRegMu.Unlock()
++	go func() {
++		<-run.switchCh
++		close(observed)
++		<-release
++		cancel()
++		close(run.done)
++	}()
++	return run, observed, release
++}
++
++// TestPublishMusicPath_StopsActiveRunBeforeBoundary 发布必须先停止并 join 旧扫描，
++// join 完成前不得落库、不得切换 Scanner，且闸门期间拒绝新扫描；join 后统一生效。
++func TestPublishMusicPath_StopsActiveRunBeforeBoundary(t *testing.T) {
++	rootA := filepath.Join(t.TempDir(), "a")
++	rootB := filepath.Join(t.TempDir(), "b")
++	if err := os.MkdirAll(rootA, 0755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(rootB, 0755); err != nil {
++		t.Fatal(err)
++	}
++	_, svc := newPublishTestService(t, rootA)
++
++	run, observed, release := registerBlockingRun(svc)
++	pubErr := make(chan error, 1)
++	go func() {
++		_, err := svc.PublishMusicPath(context.Background(), MusicPathConfig{Path: rootB}, nil)
++		pubErr <- err
++	}()
++
++	select {
++	case <-observed:
++	case <-time.After(5 * time.Second):
++		t.Fatal("发布流程应关闭旧扫描的 switchCh")
++	}
++	if !run.abandoned.Load() {
++		t.Error("旧扫描应被标记 abandoned")
++	}
++
++	// join 完成前：旧配置仍在线，且新扫描被闸门拒绝。
++	if svc.Scanner().GetMusicPath() != rootA {
++		t.Errorf("join 完成前不得切换 Scanner, got %q", svc.Scanner().GetMusicPath())
++	}
++	var persisted MusicPathConfig
++	_ = svc.configService.GetJSON(musicPathConfigKey, &persisted)
++	if persisted.Path == rootB {
++		t.Error("join 完成前不得落库新一代配置")
++	}
++	if err := svc.ScanAndImportAsync(false, nil); err == nil {
++		t.Error("发布闸门期间应拒绝新扫描")
++	}
++
++	close(release)
++	select {
++	case err := <-pubErr:
++		if err != nil {
++			t.Fatalf("PublishMusicPath: %v", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("发布流程在旧扫描收尾后未返回")
++	}
++	if svc.Scanner().GetMusicPath() != rootB || svc.ScanGeneration() != 1 {
++		t.Errorf("发布后 binding 异常: root=%q gen=%d", svc.Scanner().GetMusicPath(), svc.ScanGeneration())
++	}
++
++	// 闸门释放：新扫描可以启动并使用新规则（空根目录，快速完成）。
++	if err := svc.ScanAndImportAsync(false, nil); err != nil {
++		t.Fatalf("发布完成后应允许新扫描: %v", err)
++	}
++	if p := waitScanTerminal(t, svc); p.Status != ScanStatusCompleted {
++		t.Fatalf("新一代扫描状态: %+v", p)
++	}
++}
++
++// TestAbandonedRun_DoesNotWriteBatches 已被发布边界废弃的批次即使到达 flush 收口点，
++// 也不得写库、不得更新进度。
++func TestAbandonedRun_DoesNotWriteBatches(t *testing.T) {
++	mdb := testutil.OpenMemoryDB(t)
++	svc := NewSongService(mdb.SongRepository(), mdb, nil, NewScanner(&ScanConfig{MusicPath: t.TempDir()}), nil, nil)
++	run := newDirectScanRun(t, svc.Scanner())
++	run.abandoned.Store(true)
++
++	batch := []scanExtractResult{{
++		item:     scanProcessItem{filePath: filepath.Join(t.TempDir(), "x.flac")},
++		metadata: &Metadata{Title: "should-not-exist", Format: "flac"},
++	}}
++	svc.flushScanBatch(context.Background(), run, batch)
++
++	n, err := mdb.SongRepository().Count(context.Background(), &database.SongFilter{Type: models.TypeLocal})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n != 0 {
++		t.Errorf("废弃批次写入了 %d 条记录，应为 0", n)
++	}
++}
++
++// TestScannerOwnsPath 直接覆盖新规则判定的边界情形。
++func TestScannerOwnsPath(t *testing.T) {
++	sep := string(filepath.Separator)
++	root := filepath.Clean(sep + "music")
++	sc := func(excludeDirs, excludePaths []string) *Scanner {
++		return NewScanner(&ScanConfig{MusicPath: root, ExcludeDirs: excludeDirs, ExcludePaths: excludePaths})
++	}
++
++	if !sc(nil, nil).OwnsPath(filepath.Join(root, "a.flac")) {
++		t.Error("根目录下的普通文件应属于配置")
++	}
++	if sc(nil, nil).OwnsPath(filepath.Join(sep+"other", "a.flac")) {
++		t.Error("根目录之外的文件不应属于配置")
++	}
++	if sc([]string{"secret"}, nil).OwnsPath(filepath.Join(root, "secret", "a.flac")) {
++		t.Error("排除名称命中目录中的文件不应属于配置")
++	}
++	excluded := filepath.Join(root, "noscan")
++	if sc(nil, []string{excluded}).OwnsPath(filepath.Join(excluded, "a.flac")) {
++		t.Error("排除路径命中的文件不应属于配置")
++	}
++}
+diff --git a/internal/services/scan_test_helpers_test.go b/internal/services/scan_test_helpers_test.go
+new file mode 100644
+index 0000000..e1a032a
+--- /dev/null
++++ b/internal/services/scan_test_helpers_test.go
+@@ -0,0 +1,21 @@
++package services
++
++import (
++	"context"
++	"testing"
++)
++
++// newDirectScanRun 构造一个不走 ScanAndImportAsync 注册流程的 scanRun，
++// 供直接调用 doScanAndImport 的测试使用（无用户取消通道、代际 0、未发布）。
++func newDirectScanRun(t *testing.T, scanner *Scanner) *scanRun {
++	t.Helper()
++	ctx, cancel := context.WithCancel(context.Background())
++	t.Cleanup(cancel)
++	return &scanRun{
++		scanner:  scanner,
++		switchCh: make(chan struct{}),
++		done:     make(chan struct{}),
++		ctx:      ctx,
++		cancelFn: cancel,
++	}
++}
+diff --git a/internal/services/scanner.go b/internal/services/scanner.go
+index da883f0..b52f470 100644
+--- a/internal/services/scanner.go
++++ b/internal/services/scanner.go
+@@ -328,6 +328,24 @@ func (s *Scanner) IsFileInExcludedArea(filePath string) bool {
+ 	return s.ShouldExcludeDir(dirPath)
+ }
+ 
++// OwnsPath 判断一条既有记录（音频文件或 CUE 源路径）是否属于本扫描配置：
++// 位于音乐根目录之下（含根目录本身）且未被任何排除规则命中。
++//
++// 与「文件是否还在磁盘上」无关——配置发布时据此决定记录去留：音乐根目录改走、
++// 或目录新进入排除范围后，即使旧文件真实存在，其记录也必须清除。
++// 路径与音乐根目录的绝对/相对性不一致（如历史相对路径记录撞上绝对根目录）时
++// 无法比较前缀，跳过根目录判定，仅按排除规则处置，避免误删。
++func (s *Scanner) OwnsPath(p string) bool {
++	cleanPath := filepath.Clean(p)
++	root := filepath.Clean(s.config.MusicPath)
++	if filepath.IsAbs(cleanPath) == filepath.IsAbs(root) {
++		if cleanPath != root && !strings.HasPrefix(cleanPath, root+string(os.PathSeparator)) {
++			return false
++		}
++	}
++	return !s.ShouldExcludeDir(filepath.Dir(cleanPath))
++}
++
+ // GetMusicPath 获取音乐目录路径
+ func (s *Scanner) GetMusicPath() string {
+ 	return s.config.MusicPath
+diff --git a/internal/services/song_service.go b/internal/services/song_service.go
+index fa08fae..6e0a90a 100644
+--- a/internal/services/song_service.go
++++ b/internal/services/song_service.go
+@@ -77,12 +77,20 @@ type PlaylistAutoCreator interface {
+ 	AutoCreate(ctx context.Context, playlistMode string, excludeDirs []string, coverStoragePath string, musicPath string) (*models.AutoCreatePlaylistsResponse, error)
+ }
+ 
++// scannerBinding 把一代 Scanner 与其配置代际绑定后原子发布。
++// 扫描任务启动时一次性捕获本结构，运行期不再回读，杜绝「跑到一半用上新配置」；
++// 发布边界（PublishMusicPath）整体替换本结构，新任务统一看到新一代。
++type scannerBinding struct {
++	scanner    *Scanner
++	generation uint64 // 已成功发布的配置代际，初代为 0；每次 PublishMusicPath +1
++}
++
+ // SongService 歌曲服务
+ type SongService struct {
+ 	songs               SongRepository
+ 	tx                  Transactor
+ 	metadataExtractor   *MetadataExtractor
+-	scanner             atomic.Pointer[Scanner] // 配置变更时经 SetScanner 原子替换，doScanAndImport 等在 goroutine 中读取
++	binding             atomic.Pointer[scannerBinding] // 当前已发布的扫描器+代际，PublishMusicPath 原子替换
+ 	scanProgressManager *ScanProgressManager
+ 	configService       *ConfigService
+ 	playlistAutoCreator PlaylistAutoCreator
+@@ -90,6 +98,16 @@ type SongService struct {
+ 	cacheService       atomic.Pointer[CacheService]       // 可选;Delete/BatchDelete 时清理 cache 残留
+ 	fingerprintService atomic.Pointer[FingerprintService] // 可选;扫描完成后自动计算指纹
+ 	songTagService     atomic.Pointer[SongTagService]     // 可选;扫描时从文件 SONGLOFT_TAGS 自动导入标签
++
++	// 配置发布与扫描启动的协调：
++	// publishMu 串行化整个发布流程；startMu 保证「扫描注册」与「发布关闸」互斥；
++	// publishing 为发布闸门，闸门期间手动/自动扫描一律不得启动。
++	publishMu sync.Mutex
++	startMu   sync.Mutex
++	publishing atomic.Bool
++	// scanRegMu 守护 activeRun 的登记/注销，发布时据此停止并等待旧扫描收尾。
++	scanRegMu sync.Mutex
++	activeRun *scanRun
+ }
+ 
+ // NewSongService 创建歌曲服务
+@@ -109,13 +127,40 @@ func NewSongService(
+ 		configService:       configService,
+ 		playlistAutoCreator: playlistAutoCreator,
+ 	}
+-	svc.scanner.Store(scanner)
++	svc.binding.Store(&scannerBinding{scanner: scanner})
+ 	return svc
+ }
+ 
+-// SetScanner 更新扫描器引用（配置变更时调用）
++// SetScanner 更新扫描器引用（保持既有调用方兼容；代际不变）。
++// 注意：运行时切换音乐目录配置应走 PublishMusicPath（发布边界语义），
++// 直接替换不会停止在跑扫描，也不会清理曲库。
+ func (s *SongService) SetScanner(scanner *Scanner) {
+-	s.scanner.Store(scanner)
++	for {
++		old := s.binding.Load()
++		if old == nil {
++			s.binding.Store(&scannerBinding{scanner: scanner})
++			return
++		}
++		if s.binding.CompareAndSwap(old, &scannerBinding{scanner: scanner, generation: old.generation}) {
++			return
++		}
++	}
++}
++
++// Scanner 返回当前已发布的扫描器（可能为 nil，仅测试中未注入时出现）。
++func (s *SongService) Scanner() *Scanner {
++	if b := s.binding.Load(); b != nil {
++		return b.scanner
++	}
++	return nil
++}
++
++// ScanGeneration 返回当前已成功发布的配置代际。
++func (s *SongService) ScanGeneration() uint64 {
++	if b := s.binding.Load(); b != nil {
++		return b.generation
++	}
++	return 0
+ }
+ 
+ // SetCacheService 注入 cache 服务,使 Delete/BatchDelete 能联动清理 cache 文件。
+@@ -522,12 +567,44 @@ func (s *SongService) ListIDs(ctx context.Context, filter *database.SongFilter)
+ // paths 为空时扫描整个音乐根目录；非空时只扫描给定目录（含子目录），
+ // 用于目录级定向扫描（Issue #262），此时过期记录清理也仅收敛到这些目录之内。
+ func (s *SongService) ScanAndImportAsync(reimport bool, paths []string) error {
++	// 扫描注册与发布关闸互斥：发布进行中拒绝一切新扫描（手动 POST 收到 409，
++	// 自动调度仅 debug 日志跳过），保证切换窗口内不会混入任何新一代/旧代扫描。
++	s.startMu.Lock()
++	defer s.startMu.Unlock()
++
++	if s.publishing.Load() {
++		return fmt.Errorf("scan config publish in progress")
++	}
+ 	if !s.scanProgressManager.Start() {
+ 		return fmt.Errorf("scan already in progress")
+ 	}
++
++	binding := s.binding.Load()
++	run := &scanRun{
++		switchCh: make(chan struct{}),
++		done:     make(chan struct{}),
++	}
++	if binding != nil {
++		run.generation = binding.generation
++		run.scanner = binding.scanner
++	}
++	run.userCancel = s.scanProgressManager.GetCancelChannel()
++	run.ctx, run.cancelFn = context.WithCancel(context.Background())
++	s.scanRegMu.Lock()
++	s.activeRun = run
++	s.scanRegMu.Unlock()
++
+ 	go func() {
+-		ctx := context.Background()
+-		s.doScanAndImport(ctx, reimport, paths)
++		defer close(run.done)
++		defer run.cancelFn()
++		defer func() {
++			s.scanRegMu.Lock()
++			if s.activeRun == run {
++				s.activeRun = nil
++			}
++			s.scanRegMu.Unlock()
++		}()
++		s.doScanAndImport(run, reimport, paths)
+ 	}()
+ 	return nil
+ }
+@@ -568,46 +645,51 @@ func fileModTimeMatches(stored *time.Time, current time.Time) bool {
+ //  1. 预过滤：快速跳过已存在的文件，减少不必要的处理
+ //  2. 并发提取：使用worker池并行提取元数据，充分利用多核CPU
+ //  3. 批量写入：通过事务批量提交数据库操作，减少磁盘IO和锁竞争
+-func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeRoots []string) {
+-	cancelCh := s.scanProgressManager.GetCancelChannel()
++func (s *SongService) doScanAndImport(run *scanRun, reimport bool, scopeRoots []string) {
++	ctx := run.ctx
+ 
+-	// flushCtx 刻意保留取消前的 ctx，专供 flushScanBatch 写库使用。
+-	// 取消时要把已提取的成果落库（见提取循环收尾），若沿用下面派生的可取消 ctx，
++	// flushCtx 刻意脱离取消信号，专供 flushScanBatch 写库使用。
++	// 用户取消时要把已提取的成果落库（见提取循环收尾），若沿用可取消 ctx，
+ 	// 事务会立刻失败、重试三次后全部记为 failed——「取消保留成果」会静默不生效。
+-	// 单批写入很短，不随取消中断也不会拖住取消响应。
+-	flushCtx := ctx
++	// 配置发布停止时则在更上层直接跳过 flush（abandoned），不会走到写库。
++	flushCtx := context.WithoutCancel(ctx)
+ 
+-	// 派生可取消 ctx：用户取消时同步 cancel，使 CUE 切分阶段的 ffmpeg 子进程
+-	// （exec.CommandContext）被及时杀掉，而非等其自然结束。
+-	ctx, cancel := context.WithCancel(ctx)
+-	defer cancel()
++	// 用户取消与配置发布都会 cancel run.ctx，使遍历/CUE 阶段的 ffprobe 子进程
++	// （exec.CommandContext）被及时杀掉；发布停止额外置 abandoned 屏障。
+ 	go func() {
+ 		select {
+-		case <-cancelCh:
+-			cancel()
++		case <-run.switchCh:
++			run.abandoned.Store(true)
++			run.cancelFn()
++		case <-run.userCancel:
++			run.cancelFn()
+ 		case <-ctx.Done():
+ 		}
+ 	}()
+ 
+-	scanResult, err := s.scanner.Load().ScanFilesWithCueInDirs(ctx, scopeRoots, func(count int) {
++	if run.scanner == nil {
++		s.scanProgressManager.Fail(fmt.Errorf("扫描器未初始化"))
++		return
++	}
++
++	scanResult, err := run.scanner.ScanFilesWithCueInDirs(ctx, scopeRoots, func(count int) {
+ 		s.scanProgressManager.SetDiscoveredFiles(count)
+ 	})
+ 	if err != nil {
++		if s.terminalizeIfStopped(run) {
++			return
++		}
+ 		s.scanProgressManager.Fail(fmt.Errorf("failed to scan files: %w", err))
+ 		return
+ 	}
+-	files := scanResult.AudioFiles
+-
+-	select {
+-	case <-cancelCh:
+-		s.scanProgressManager.SetCancelled()
++	if s.terminalizeIfStopped(run) {
+ 		return
+-	default:
+ 	}
++	files := scanResult.AudioFiles
+ 
+ 	s.scanProgressManager.SetTotalFiles(len(files))
+ 
+-	s.deduplicateLocalSongPaths(ctx)
++	s.deduplicateLocalSongPaths(ctx, run.scanner)
+ 
+ 	existingPaths, err := s.songs.ListLocalPaths(ctx)
+ 	if err != nil {
+@@ -626,11 +708,8 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 
+ 	toProcess := make([]scanProcessItem, 0, len(files))
+ 	for _, filePath := range files {
+-		select {
+-		case <-cancelCh:
+-			s.scanProgressManager.SetCancelled()
++		if s.terminalizeIfStopped(run) {
+ 			return
+-		default:
+ 		}
+ 
+ 		info, exists := existingPaths[filePath]
+@@ -671,22 +750,24 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 		s.scanProgressManager.SetCleanedFiles(cleanedCount)
+ 	}
+ 
++	// 后续所有阶段共用的收尾闸门：用户取消保留成果走 CUE/歌单前的原检查点，
++	// 配置发布则任何阶段都立即终止且不产生副作用。
+ 	if len(toProcess) == 0 {
+-		s.runCueProcessing(ctx, scanResult, files, reimport, scopeRoots)
+-		select {
+-		case <-cancelCh:
+-			s.scanProgressManager.SetCancelled()
++		s.runCueProcessing(run, scanResult, files, reimport, scopeRoots)
++		if s.terminalizeIfStopped(run) {
+ 			return
+-		default:
+ 		}
+ 		if s.configService != nil && s.configService.GetBool("scan_auto_create_playlists", true) {
+-			s.runAutoCreatePlaylists(ctx)
++			s.runAutoCreatePlaylists(run)
+ 		} else {
+ 			slog.Info("auto-create playlists disabled, skipping")
+ 		}
++		if s.terminalizeIfStopped(run) {
++			return
++		}
+ 		s.setLocalSongCount(ctx)
+ 		s.scanProgressManager.Complete()
+-		s.runAutoFingerprint()
++		s.runAutoFingerprint(run)
+ 		return
+ 	}
+ 
+@@ -700,7 +781,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 			defer wg.Done()
+ 			for item := range inputCh {
+ 				select {
+-				case <-cancelCh:
++				case <-ctx.Done():
+ 					return
+ 				default:
+ 				}
+@@ -749,7 +830,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 
+ 				var fileSize int64
+ 				var fileModTime time.Time
+-				if fileInfo, err := s.scanner.Load().GetFileInfo(item.filePath); err == nil {
++				if fileInfo, err := run.scanner.GetFileInfo(item.filePath); err == nil {
+ 					fileSize = fileInfo.Size
+ 					fileModTime = fileInfo.ModTime
+ 				}
+@@ -762,7 +843,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 					fileModTime:      fileModTime,
+ 					extractionFailed: extractionFailed,
+ 				}:
+-				case <-cancelCh:
++				case <-ctx.Done():
+ 					return
+ 				}
+ 			}
+@@ -774,7 +855,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 		for _, item := range toProcess {
+ 			select {
+ 			case inputCh <- item:
+-			case <-cancelCh:
++			case <-ctx.Done():
+ 				return
+ 			}
+ 		}
+@@ -789,57 +870,60 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
+ 	// 全量累积会让几万首的曲库在整个提取阶段（数十分钟）里进度恒为 0、
+ 	// 数据库一条不写，用户只能判定为卡死（songloft-org/songloft#447）。
+ 	acc := newScanBatchAccumulator(toProcess, scanDirGroupCap)
+-	cancelled := false
++	userCancelled := false
+ 	for result := range resultCh {
++		// 发布边界已落下：继续排空 worker（否则它们可能阻塞在发送上无法退出），
++		// 但所有旧代结果一律丢弃——发现/已提取/待批量提交的都不允许越过边界写库。
++		if run.switched() {
++			continue
++		}
+ 		select {
+-		case <-cancelCh:
+-			cancelled = true
++		case <-run.userCancel:
++			userCancelled = true
+ 		default:
+ 		}
+-		// 取消后仍收下已提取的结果：worker 正在退出，这些元数据已经花掉了 IO 与 CPU，
++		// 用户取消后仍收下已提取的结果：worker 正在退出，这些元数据已经花掉了 IO 与 CPU，
+ 		// 丢弃等于让用户白干（#447 的用户连续取消两次，每次作废十分钟的提取）。
+ 		acc.add(result)
+ 		for batch := acc.takeBatch(dbBatchSize, false); batch != nil; batch = acc.takeBatch(dbBatchSize, false) {
+-			s.flushScanBatch(flushCtx, batch)
++			s.flushScanBatch(flushCtx, run, batch)
+ 		}
+ 	}
+ 
+-	// 取消时 pending 永远归不了零，这里把未提取完的目录组也按现有样本定稿冲出来。
+-	acc.sealAll()
+-	for batch := acc.takeBatch(dbBatchSize, true); batch != nil; batch = acc.takeBatch(dbBatchSize, true) {
+-		s.flushScanBatch(flushCtx, batch)
++	// 发布停止：不 seal、不 flush、不进 CUE/歌单/指纹阶段，直接终态化退出。
++	if run.switched() {
++		s.scanProgressManager.SetStoppedExternally()
++		return
+ 	}
+ 
+-	if cancelled {
+-		s.scanProgressManager.SetCancelled()
+-		return
++	// 用户取消时 pending 永远归不了零，这里把未提取完的目录组也按现有样本定稿冲出来。
++	acc.sealAll()
++	for batch := acc.takeBatch(dbBatchSize, true); batch != nil; batch = acc.takeBatch(dbBatchSize, true) {
++		s.flushScanBatch(flushCtx, run, batch)
+ 	}
+ 
+-	select {
+-	case <-cancelCh:
++	if userCancelled {
+ 		s.scanProgressManager.SetCancelled()
+ 		return
+-	default:
+ 	}
+ 
+ 	// CUE 整轨处理
+-	s.runCueProcessing(ctx, scanResult, files, reimport, scopeRoots)
+-
+-	select {
+-	case <-cancelCh:
+-		s.scanProgressManager.SetCancelled()
++	s.runCueProcessing(run, scanResult, files, reimport, scopeRoots)
++	if s.terminalizeIfStopped(run) {
+ 		return
+-	default:
+ 	}
+ 
+ 	if s.configService != nil && s.configService.GetBool("scan_auto_create_playlists", true) {
+-		s.runAutoCreatePlaylists(ctx)
++		s.runAutoCreatePlaylists(run)
+ 	} else {
+ 		slog.Info("auto-create playlists disabled, skipping")
+ 	}
++	if s.terminalizeIfStopped(run) {
++		return
++	}
+ 	s.setLocalSongCount(ctx)
+ 	s.scanProgressManager.Complete()
+-	s.runAutoFingerprint()
++	s.runAutoFingerprint(run)
+ }
+ 
+ // setLocalSongCount 查询 DB 中本地歌曲总数并写入扫描进度，供前端展示。
+@@ -854,18 +938,23 @@ func (s *SongService) setLocalSongCount(ctx context.Context) {
+ 
+ // runCueProcessing 执行 CUE 处理阶段（外部 .cue + FLAC 内嵌 CUESHEET），
+ // 并清理失效的 CUE 记录。仅解析元数据和入库，播放时按需提取。
+-func (s *SongService) runCueProcessing(ctx context.Context, scanResult *ScanResult, files []string, reimport bool, scopeRoots []string) {
++// 发布边界落下后整个阶段不启动、不写库（旧代 CUE 结果不能越过边界）。
++func (s *SongService) runCueProcessing(run *scanRun, scanResult *ScanResult, files []string, reimport bool, scopeRoots []string) {
++	if run.abandoned.Load() {
++		return
++	}
+ 	s.scanProgressManager.BeginSplittingCue()
+-	s.processCueFiles(ctx, scanResult.CueFiles, reimport)
+-	s.processEmbeddedCueSheets(ctx, files, reimport)
+-	s.cleanStaleCueRecords(ctx, scopeRoots)
++	s.processCueFiles(run, scanResult.CueFiles, reimport)
++	s.processEmbeddedCueSheets(run, files, reimport)
++	if !run.abandoned.Load() {
++		s.cleanStaleCueRecords(run.ctx, scopeRoots)
++	}
+ }
+ 
+ // deduplicateLocalSongPaths 规范化非绝对路径的本地歌曲 file_path，
+ // 修复因历史版本 music_path 配置变更导致的同一文件存在相对/绝对两条记录的问题。
+ // 有绝对路径副本的删除相对路径行；无副本的 UPDATE 为绝对路径。
+-func (s *SongService) deduplicateLocalSongPaths(ctx context.Context) {
+-	sc := s.scanner.Load()
++func (s *SongService) deduplicateLocalSongPaths(ctx context.Context, sc *Scanner) {
+ 	if sc == nil {
+ 		return
+ 	}
+@@ -930,10 +1019,12 @@ func (s *SongService) deduplicateLocalSongPaths(ctx context.Context) {
+ 
+ // runAutoCreatePlaylists 扫描完成后按当前 playlistMode 配置重建 auto_created 歌单。
+ // 失败仅记录日志，不影响扫描的「完成」状态——下次扫描会再次尝试。
+-func (s *SongService) runAutoCreatePlaylists(ctx context.Context) {
+-	if s.playlistAutoCreator == nil {
++// 配置发布落下边界（run.abandoned）后绝不执行——旧任务不得再创建歌单。
++func (s *SongService) runAutoCreatePlaylists(run *scanRun) {
++	if s.playlistAutoCreator == nil || run.abandoned.Load() {
+ 		return
+ 	}
++	ctx := run.ctx
+ 	s.scanProgressManager.BeginCreatingPlaylists()
+ 
+ 	playlistMode := models.PlaylistModeDirectory
+@@ -951,10 +1042,9 @@ func (s *SongService) runAutoCreatePlaylists(ctx context.Context) {
+ 	if s.metadataExtractor != nil {
+ 		coverStoragePath = s.metadataExtractor.CoverStoragePath()
+ 	}
+-	var musicPath string
+-	if sc := s.scanner.Load(); sc != nil {
+-		musicPath = sc.GetMusicPath()
+-	}
++	// 音乐根目录取本扫描启动时捕获的 Scanner，不回读当前 binding——
++	// 该函数能执行就说明本次发布未切换，二者此刻必然一致。
++	musicPath := run.scanner.GetMusicPath()
+ 	if _, err := s.playlistAutoCreator.AutoCreate(ctx, playlistMode, autoCreateExcludeDirs, coverStoragePath, musicPath); err != nil {
+ 		slog.Warn("自动创建歌单失败", "playlist_mode", playlistMode, "error", err)
+ 	}
+@@ -963,7 +1053,13 @@ func (s *SongService) runAutoCreatePlaylists(ctx context.Context) {
+ // runAutoFingerprint 扫描完成后自动为缺失指纹的歌曲计算指纹。
+ // 默认关闭：指纹只服务于「重复歌曲检测」与插件歌词/封面搜索，属按需功能，
+ // 全库自动计算会在扫描「完成」之后继续长时间占满 CPU（songloft-org/songloft#323）。
+-func (s *SongService) runAutoFingerprint() {
++// 配置发布落下边界后绝不启动——旧任务不得再触发指纹计算；发布流程还会额外
++// Cancel() 掉扫描尾部已经异步启动的指纹任务。
++func (s *SongService) runAutoFingerprint(run *scanRun) {
++	if run.abandoned.Load() {
++		slog.Info("auto fingerprint skipped: scan generation superseded")
++		return
++	}
+ 	// 注意判定方向：configService 缺失时也必须跳过（默认关闭），
+ 	// 不能写成 `configService != nil && !GetBool(...)`——那样注入缺失反而会放行全库计算。
+ 	if s.configService == nil || !s.configService.GetBool("scan_auto_fingerprint", false) {
+@@ -1030,7 +1126,11 @@ func fixSpamTags(results []scanExtractResult) {
+ 
+ // flushScanBatch 批量处理扫描结果，使用事务提高写入效率
+ // 将多条数据库操作合并在同一事务中提交，减少磁盘fsync次数和WAL刷写开销
+-func (s *SongService) flushScanBatch(ctx context.Context, batch []scanExtractResult) {
++func (s *SongService) flushScanBatch(ctx context.Context, run *scanRun, batch []scanExtractResult) {
++	// 发布边界落下后，任何等待批量提交的旧代结果都不允许再写库，也不更新进度。
++	if run.abandoned.Load() {
++		return
++	}
+ 	if s.tx == nil {
+ 		slog.Error("flushScanBatch 缺少事务执行器,跳过批次")
+ 		for _, r := range batch {
+@@ -1363,7 +1463,7 @@ func (s *SongService) CleanInvalidSongs(ctx context.Context) (*CleanResult, erro
+ 		shouldClean := false
+ 		reason := ""
+ 
+-		scanner := s.scanner.Load()
++		scanner := s.Scanner()
+ 		if _, err := os.Stat(song.FilePath); os.IsNotExist(err) {
+ 			shouldClean = true
+ 			reason = "file_not_found"
+@@ -1600,7 +1700,7 @@ type organizePlan struct {
+ 
+ // resolveMusicPath 返回当前 music_path；未配置时报错。
+ func (s *SongService) resolveMusicPath() (string, error) {
+-	scanner := s.scanner.Load()
++	scanner := s.Scanner()
+ 	if scanner == nil {
+ 		return "", fmt.Errorf("music_path 未配置")
+ 	}
+diff --git a/internal/services/song_service_cue.go b/internal/services/song_service_cue.go
+index f159c9f..5676c62 100644
+--- a/internal/services/song_service_cue.go
++++ b/internal/services/song_service_cue.go
+@@ -17,14 +17,18 @@ import (
+ )
+ 
+ // processCueFiles 处理外部 .cue 文件：解析、入库（按需提取替代预分割）。
+-func (s *SongService) processCueFiles(ctx context.Context, cueFiles []string, reimport bool) {
++func (s *SongService) processCueFiles(run *scanRun, cueFiles []string, reimport bool) {
+ 	if len(cueFiles) == 0 {
+ 		return
+ 	}
++	ctx := run.ctx
+ 
+ 	existingSources := s.listCueSourceSet(ctx)
+ 
+ 	for _, cuePath := range cueFiles {
++		if run.abandoned.Load() {
++			return
++		}
+ 		select {
+ 		case <-ctx.Done():
+ 			return
+@@ -43,15 +47,19 @@ func (s *SongService) processCueFiles(ctx context.Context, cueFiles []string, re
+ 			continue
+ 		}
+ 
+-		s.processCueSheet(ctx, cuePath, sheet, reimport)
++		s.processCueSheet(run, cuePath, sheet, reimport)
+ 	}
+ }
+ 
+ // processEmbeddedCueSheets 检测 FLAC 文件中的内嵌 CUESHEET block。
+-func (s *SongService) processEmbeddedCueSheets(ctx context.Context, audioFiles []string, reimport bool) {
++func (s *SongService) processEmbeddedCueSheets(run *scanRun, audioFiles []string, reimport bool) {
++	ctx := run.ctx
+ 	existingSources := s.listCueSourceSet(ctx)
+ 
+ 	for _, filePath := range audioFiles {
++		if run.abandoned.Load() {
++			return
++		}
+ 		select {
+ 		case <-ctx.Done():
+ 			return
+@@ -112,7 +120,7 @@ func (s *SongService) processEmbeddedCueSheets(ctx context.Context, audioFiles [
+ 		}
+ 
+ 		// 对于内嵌 CUESHEET，cueSourcePath 是 FLAC 文件本身
+-		s.processCueSheet(ctx, filePath, sheet, reimport)
++		s.processCueSheet(run, filePath, sheet, reimport)
+ 	}
+ }
+ 
+@@ -154,7 +162,13 @@ func secondsToCueTime(seconds float64) cue.CUETime {
+ 
+ // processCueSheet 处理一个 CUE Sheet：解析 track 起止时间并入库。
+ // 不再预分割音频文件；播放时由 CacheService 按需提取。
+-func (s *SongService) processCueSheet(ctx context.Context, cueSourcePath string, sheet *cue.CUESheet, reimport bool) {
++// 发布边界落下后（run.abandoned）直接返回：处理中的旧 CUE 结果不得越过边界写库，
++// 也不得再更新扫描进度。
++func (s *SongService) processCueSheet(run *scanRun, cueSourcePath string, sheet *cue.CUESheet, reimport bool) {
++	if run.abandoned.Load() {
++		return
++	}
++	ctx := run.ctx
+ 	s.scanProgressManager.UpdateCueProgress(cueSourcePath)
+ 
+ 	cueDir := filepath.Dir(cueSourcePath)
+@@ -186,6 +200,9 @@ func (s *SongService) processCueSheet(ctx context.Context, cueSourcePath string,
+ 
+ 	// 重新导入时先删除旧记录
+ 	if reimport {
++		if run.abandoned.Load() {
++			return
++		}
+ 		if n, err := s.songs.DeleteByCueSource(ctx, cueSourcePath); err == nil && n > 0 {
+ 			slog.Info("重新导入 CUE，删除旧记录", "source", cueSourcePath, "deleted", n)
+ 		}
+@@ -242,6 +259,10 @@ func (s *SongService) processCueSheet(ctx context.Context, cueSourcePath string,
+ 		songs = append(songs, song)
+ 	}
+ 
++	// 批量入库前最后一道屏障：提取/解析期间发布边界可能已落下。
++	if run.abandoned.Load() {
++		return
++	}
+ 	// 批量入库
+ 	err = s.tx.RunInTx(ctx, func(ctx context.Context, uow *database.UnitOfWork) error {
+ 		for _, song := range songs {
+diff --git a/internal/services/song_service_test.go b/internal/services/song_service_test.go
+index 549c748..fe23921 100644
+--- a/internal/services/song_service_test.go
++++ b/internal/services/song_service_test.go
+@@ -165,7 +165,8 @@ func TestRunAutoCreatePlaylistsReadsConfig(t *testing.T) {
+ 	stub := &stubPlaylistAutoCreator{}
+ 	service := NewSongService(repo, nil, nil, nil, configService, stub)
+ 
+-	service.runAutoCreatePlaylists(context.Background())
++	run := newDirectScanRun(t, NewScanner(&ScanConfig{MusicPath: "music"}))
++	service.runAutoCreatePlaylists(run)
+ 
+ 	if stub.calls != 1 {
+ 		t.Fatalf("AutoCreate calls = %d, want 1", stub.calls)
+@@ -182,7 +183,8 @@ func TestRunAutoCreatePlaylistsReadsConfig(t *testing.T) {
+ func TestRunAutoCreatePlaylistsSkipsWhenNil(t *testing.T) {
+ 	repo := newTestSongRepo(t)
+ 	service := NewSongService(repo, nil, nil, nil, nil, nil)
+-	service.runAutoCreatePlaylists(context.Background())
++	run := newDirectScanRun(t, nil)
++	service.runAutoCreatePlaylists(run)
+ 	if got := service.scanProgressManager.GetProgress().Status; got == ScanStatusCreatingPlaylists {
+ 		t.Errorf("scan status should not be creating_playlists when stub absent")
+ 	}

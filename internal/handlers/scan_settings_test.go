@@ -1,13 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"songloft/internal/database/testutil"
 	"songloft/internal/services"
@@ -43,19 +44,21 @@ func TestMusicPathSetting_GetDefault(t *testing.T) {
 	}
 }
 
-// TestMusicPathSetting_UpdateThenReadAndCallback PUT 写入后 GET 读到最新值，
-// 且 onMusicPathChanged 回调被异步触发（保证 Scanner 重建副作用）。
-func TestMusicPathSetting_UpdateThenReadAndCallback(t *testing.T) {
+// TestMusicPathSetting_UpdateThenReadAndPublish PUT 必须同步走完发布器后才返回成功，
+// 响应携带新代际号，且 GET 能读到已发布的值。
+func TestMusicPathSetting_UpdateThenReadAndPublish(t *testing.T) {
 	h := newTestScanHandlerWithConfig(t)
 
-	called := make(chan struct{}, 1)
 	var callCount atomic.Int32
-	h.SetOnMusicPathChanged(func() {
+	var published services.MusicPathConfig
+	h.SetMusicPathPublisher(func(_ context.Context, cfg services.MusicPathConfig) (uint64, error) {
 		callCount.Add(1)
-		select {
-		case called <- struct{}{}:
-		default:
+		published = cfg
+		// 发布器语义上负责持久化；这里同步写入，验证 GET 读回路径。
+		if err := h.configService.SetJSON("music_path", cfg); err != nil {
+			return 0, err
 		}
+		return 7, nil
 	})
 
 	body := `{"path":"/data/music","exclude_dirs":["tmp",".cache"],"exclude_paths":["/data/music/old"]}`
@@ -65,15 +68,18 @@ func TestMusicPathSetting_UpdateThenReadAndCallback(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("PUT status: got %d want 200, body=%s", rr.Code, rr.Body.String())
 	}
-
-	// 等回调（异步）
-	select {
-	case <-called:
-	case <-time.After(time.Second):
-		t.Fatal("onMusicPathChanged callback should fire after PUT")
-	}
 	if callCount.Load() != 1 {
-		t.Errorf("callback should fire exactly once, got %d", callCount.Load())
+		t.Fatalf("publisher should fire exactly once, got %d", callCount.Load())
+	}
+	if published.Path != "/data/music" || len(published.ExcludeDirs) != 2 || len(published.ExcludePaths) != 1 {
+		t.Errorf("published payload mismatch: %+v", published)
+	}
+	var resp MusicPathSetting
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Generation != 7 {
+		t.Errorf("response generation: got %d want 7", resp.Generation)
 	}
 
 	// GET 读到最新值
@@ -84,7 +90,34 @@ func TestMusicPathSetting_UpdateThenReadAndCallback(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if got.Path != "/data/music" || len(got.ExcludeDirs) != 2 || len(got.ExcludePaths) != 1 {
-		t.Errorf("read-after-write mismatch: %+v", got)
+		t.Errorf("read-after-publish mismatch: %+v", got)
+	}
+}
+
+// TestMusicPathSetting_PublishFailureObservable 发布器返回错误时接口必须给出可观察的
+// 失败（500），不能假装成功。
+func TestMusicPathSetting_PublishFailureObservable(t *testing.T) {
+	h := newTestScanHandlerWithConfig(t)
+	h.SetMusicPathPublisher(func(_ context.Context, _ services.MusicPathConfig) (uint64, error) {
+		return 0, errors.New("cleanup failed")
+	})
+
+	rr := httptest.NewRecorder()
+	h.UpdateMusicPathSetting(rr, httptest.NewRequest("PUT", "/api/v1/settings/music-path",
+		strings.NewReader(`{"path":"/data/music"}`)))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("publish failure: got %d want 500, body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestMusicPathSetting_NoPublisher PUT 未注入发布器时返回 500 而非静默成功。
+func TestMusicPathSetting_NoPublisher(t *testing.T) {
+	h := newTestScanHandlerWithConfig(t)
+	rr := httptest.NewRecorder()
+	h.UpdateMusicPathSetting(rr, httptest.NewRequest("PUT", "/api/v1/settings/music-path",
+		strings.NewReader(`{"path":"/data/music"}`)))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("missing publisher: got %d want 500", rr.Code)
 	}
 }
 

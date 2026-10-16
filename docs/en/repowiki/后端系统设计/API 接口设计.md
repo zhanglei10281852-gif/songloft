@@ -156,7 +156,7 @@ The project has 14 Handlers in total, all located in `internal/handlers/`:
 
 ### 5.3 Callback Injection
 
-Some handlers bind cross-module callbacks via setters: `configHandler.SetOnConfigChanged` triggers side effects after a generic KV write, `scanHandler.SetOnMusicPathChanged` / `SetOnAutoScanChanged` bind rebuild logic after config changes, and `songHandler.SetGetMusicPath` lazily injects the Scanner's path function.
+Some handlers bind cross-module callbacks via setters: `configHandler.SetBeforeConfigChange` intercepts a KV write before persistence (used by `music_path` to run the synchronous publish boundary via `SongService.PublishMusicPath`), `configHandler.SetOnConfigChanged` triggers side effects after other generic KV writes, `scanHandler.SetMusicPathPublisher` / `SetOnAutoScanChanged` bind the publish flow and auto-scan rescheduling, and `songHandler.SetGetMusicPath` injects a closure that always reads the currently published Scanner's path.
 
 ---
 

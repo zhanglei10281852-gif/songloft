@@ -506,6 +506,36 @@ only read as a hang.
   pending count never reaches zero. Previously the whole batch was dropped, so two consecutive cancels
   threw away twenty minutes of work
 
+### music_path publish boundary (iron rule)
+
+Changing the music directory or exclusion rules (`PUT /settings/music-path` and the generic
+`PUT /configs/music_path`) must go through `SongService.PublishMusicPath`: **the successful config
+response IS the publish boundary**. The old flow ("persist first, rebuild Scanner and clean up
+asynchronously") let an old scan keep writing rows, create playlists and start fingerprints after
+the swap, so songs deleted by cleanup were resurrected by old in-flight batches. The publish order
+is fixed; any failed step returns an observable error and the old config remains fully usable:
+
+- **Close the gate → stop and join the old scan → wind down fingerprints → clean with the new rules
+  → persist the new generation → atomically swap the Scanner**. Cleanup runs before persistence, so a
+  crash on either side of the commit only restores the last successfully published generation
+- A scan captures its `scannerBinding` (Scanner + generation) once at start and never re-reads it;
+  publish replaces the whole binding atomically. The generation is persisted in the `music_path` JSON
+  (`generation` field, assigned server-side)
+- **The two stop semantics must stay distinct**: user cancel (`/scan/cancel`) keeps extracted results
+  (sealAll + flush); a publish stop (`scanRun.switchCh`) discards every old result still in discovery /
+  extraction / pending batch / CUE processing and creates no playlists and no fingerprints. Every DB
+  write chokepoint (`flushScanBatch`, `processCueSheet`, auto playlists/fingerprints) must re-check
+  `run.abandoned` first — any new scan-spawned side effect needs this fence
+- While the publish gate (`publishing`) is closed, neither manual nor automatic scans may start. Scan
+  registration and gate closing share `startMu`; the fixed lock order is `startMu → scanRegMu`, so no
+  run can register after the gate closes
+- Cleanup uses `cleanSongsForConfig` + `Scanner.OwnsPath`: records outside the new music root or
+  inside the new exclusion area are deleted **even though the old files still exist on disk**, and CUE
+  source groups are deleted as a whole; disk files are never removed. This differs from
+  `CleanInvalidSongs` (missing-file/excluded-area only, skips CUE) — don't mix them up
+- `scan_title_source` only refreshes the extractor; it must not trigger a publish or rebuild the
+  Scanner in its change callback
+
 ### Never `os.Stat` every directory entry (songloft-org/songloft#447)
 
 `scanDirWithCue` / `collectDirNames` determine entry types via `resolveEntry` (`scanner.go`):

@@ -242,6 +242,27 @@ func (m *ScanProgressManager) SetCancelled() {
 	m.progress.CurrentFile = ""
 }
 
+// SetStoppedExternally 终态化一个被「配置发布」协调停止的扫描。
+//
+// 状态语义沿用 cancelled（前端轮询、Start 放行规则都兼容），区别只是取消通道
+// 也要在这里关闭并置 nil：这种停止不经过 Cancel()（那是用户取消入口），
+// 若只置状态不关通道，会留下一个无人引用却永远开着的取消通道。
+// 调用方必须保证该扫描的全部收尾（goroutine 退出、结果不再写库）已完成或即将完成。
+func (m *ScanProgressManager) SetStoppedExternally() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	m.progress.Status = ScanStatusCancelled
+	m.progress.EndTime = &now
+	m.progress.CurrentFile = ""
+
+	if m.cancel != nil {
+		close(m.cancel)
+		m.cancel = nil
+	}
+}
+
 // GetCancelChannel 获取取消通道
 func (m *ScanProgressManager) GetCancelChannel() <-chan struct{} {
 	m.mu.RLock()

@@ -15,7 +15,11 @@ import (
 type ConfigHandler struct {
 	configService   *services.ConfigService
 	pluginRepo      tabConfigPluginSource // 插件安装状态（tab-config 的孤儿清理与限额统计用）
-	onConfigChanged func(key string)      // 配置变更回调（可选）
+	onConfigChanged func(key string)      // 配置变更回调（可选，落库后异步触发）
+	// beforeConfigChange 落库前拦截（可选）：返回 handled=true 表示该 key 由钩子以
+	// 自定义语义完成「落库 + 副作用」（如 music_path 的配置发布边界），handler 跳过
+	// 默认落库与 onConfigChanged；err 非零时按 500 返回，配置不发生变更。
+	beforeConfigChange func(key, value string) (handled bool, err error)
 }
 
 // NewConfigHandler 创建配置处理器
@@ -29,6 +33,11 @@ func NewConfigHandler(configService *services.ConfigService, pluginRepo tabConfi
 // SetOnConfigChanged 设置配置变更回调
 func (h *ConfigHandler) SetOnConfigChanged(callback func(key string)) {
 	h.onConfigChanged = callback
+}
+
+// SetBeforeConfigChange 设置落库前拦截钩子（见 beforeConfigChange 字段说明）。
+func (h *ConfigHandler) SetBeforeConfigChange(hook func(key, value string) (bool, error)) {
+	h.beforeConfigChange = hook
 }
 
 // ListConfigs 获取配置列表
@@ -195,6 +204,20 @@ func (h *ConfigHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if req.Value == "" {
 		respondError(w, http.StatusBadRequest, "配置值不能为空", nil)
 		return
+	}
+
+	// 落库前拦截：music_path 等需要发布边界语义的 key 由钩子同步完成
+	// 「停旧扫描 → 清理 → 落库 → 换 Scanner」，成功或失败都在此处对客户端可观察。
+	if h.beforeConfigChange != nil {
+		handled, hookErr := h.beforeConfigChange(key, req.Value)
+		if hookErr != nil {
+			respondError(w, http.StatusInternalServerError, "应用配置失败，已保留旧配置", hookErr)
+			return
+		}
+		if handled {
+			respondJSON(w, http.StatusOK, &models.Config{Key: key, Value: req.Value})
+			return
+		}
 	}
 
 	// 更新配置

@@ -77,12 +77,20 @@ type PlaylistAutoCreator interface {
 	AutoCreate(ctx context.Context, playlistMode string, excludeDirs []string, coverStoragePath string, musicPath string) (*models.AutoCreatePlaylistsResponse, error)
 }
 
+// scannerBinding 把一代 Scanner 与其配置代际绑定后原子发布。
+// 扫描任务启动时一次性捕获本结构，运行期不再回读，杜绝「跑到一半用上新配置」；
+// 发布边界（PublishMusicPath）整体替换本结构，新任务统一看到新一代。
+type scannerBinding struct {
+	scanner    *Scanner
+	generation uint64 // 已成功发布的配置代际，初代为 0；每次 PublishMusicPath +1
+}
+
 // SongService 歌曲服务
 type SongService struct {
 	songs               SongRepository
 	tx                  Transactor
 	metadataExtractor   *MetadataExtractor
-	scanner             atomic.Pointer[Scanner] // 配置变更时经 SetScanner 原子替换，doScanAndImport 等在 goroutine 中读取
+	binding             atomic.Pointer[scannerBinding] // 当前已发布的扫描器+代际，PublishMusicPath 原子替换
 	scanProgressManager *ScanProgressManager
 	configService       *ConfigService
 	playlistAutoCreator PlaylistAutoCreator
@@ -90,6 +98,16 @@ type SongService struct {
 	cacheService       atomic.Pointer[CacheService]       // 可选;Delete/BatchDelete 时清理 cache 残留
 	fingerprintService atomic.Pointer[FingerprintService] // 可选;扫描完成后自动计算指纹
 	songTagService     atomic.Pointer[SongTagService]     // 可选;扫描时从文件 SONGLOFT_TAGS 自动导入标签
+
+	// 配置发布与扫描启动的协调：
+	// publishMu 串行化整个发布流程；startMu 保证「扫描注册」与「发布关闸」互斥；
+	// publishing 为发布闸门，闸门期间手动/自动扫描一律不得启动。
+	publishMu sync.Mutex
+	startMu   sync.Mutex
+	publishing atomic.Bool
+	// scanRegMu 守护 activeRun 的登记/注销，发布时据此停止并等待旧扫描收尾。
+	scanRegMu sync.Mutex
+	activeRun *scanRun
 }
 
 // NewSongService 创建歌曲服务
@@ -109,13 +127,40 @@ func NewSongService(
 		configService:       configService,
 		playlistAutoCreator: playlistAutoCreator,
 	}
-	svc.scanner.Store(scanner)
+	svc.binding.Store(&scannerBinding{scanner: scanner})
 	return svc
 }
 
-// SetScanner 更新扫描器引用（配置变更时调用）
+// SetScanner 更新扫描器引用（保持既有调用方兼容；代际不变）。
+// 注意：运行时切换音乐目录配置应走 PublishMusicPath（发布边界语义），
+// 直接替换不会停止在跑扫描，也不会清理曲库。
 func (s *SongService) SetScanner(scanner *Scanner) {
-	s.scanner.Store(scanner)
+	for {
+		old := s.binding.Load()
+		if old == nil {
+			s.binding.Store(&scannerBinding{scanner: scanner})
+			return
+		}
+		if s.binding.CompareAndSwap(old, &scannerBinding{scanner: scanner, generation: old.generation}) {
+			return
+		}
+	}
+}
+
+// Scanner 返回当前已发布的扫描器（可能为 nil，仅测试中未注入时出现）。
+func (s *SongService) Scanner() *Scanner {
+	if b := s.binding.Load(); b != nil {
+		return b.scanner
+	}
+	return nil
+}
+
+// ScanGeneration 返回当前已成功发布的配置代际。
+func (s *SongService) ScanGeneration() uint64 {
+	if b := s.binding.Load(); b != nil {
+		return b.generation
+	}
+	return 0
 }
 
 // SetCacheService 注入 cache 服务,使 Delete/BatchDelete 能联动清理 cache 文件。
@@ -522,12 +567,44 @@ func (s *SongService) ListIDs(ctx context.Context, filter *database.SongFilter) 
 // paths 为空时扫描整个音乐根目录；非空时只扫描给定目录（含子目录），
 // 用于目录级定向扫描（Issue #262），此时过期记录清理也仅收敛到这些目录之内。
 func (s *SongService) ScanAndImportAsync(reimport bool, paths []string) error {
+	// 扫描注册与发布关闸互斥：发布进行中拒绝一切新扫描（手动 POST 收到 409，
+	// 自动调度仅 debug 日志跳过），保证切换窗口内不会混入任何新一代/旧代扫描。
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+
+	if s.publishing.Load() {
+		return fmt.Errorf("scan config publish in progress")
+	}
 	if !s.scanProgressManager.Start() {
 		return fmt.Errorf("scan already in progress")
 	}
+
+	binding := s.binding.Load()
+	run := &scanRun{
+		switchCh: make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	if binding != nil {
+		run.generation = binding.generation
+		run.scanner = binding.scanner
+	}
+	run.userCancel = s.scanProgressManager.GetCancelChannel()
+	run.ctx, run.cancelFn = context.WithCancel(context.Background())
+	s.scanRegMu.Lock()
+	s.activeRun = run
+	s.scanRegMu.Unlock()
+
 	go func() {
-		ctx := context.Background()
-		s.doScanAndImport(ctx, reimport, paths)
+		defer close(run.done)
+		defer run.cancelFn()
+		defer func() {
+			s.scanRegMu.Lock()
+			if s.activeRun == run {
+				s.activeRun = nil
+			}
+			s.scanRegMu.Unlock()
+		}()
+		s.doScanAndImport(run, reimport, paths)
 	}()
 	return nil
 }
@@ -568,46 +645,51 @@ func fileModTimeMatches(stored *time.Time, current time.Time) bool {
 //  1. 预过滤：快速跳过已存在的文件，减少不必要的处理
 //  2. 并发提取：使用worker池并行提取元数据，充分利用多核CPU
 //  3. 批量写入：通过事务批量提交数据库操作，减少磁盘IO和锁竞争
-func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeRoots []string) {
-	cancelCh := s.scanProgressManager.GetCancelChannel()
+func (s *SongService) doScanAndImport(run *scanRun, reimport bool, scopeRoots []string) {
+	ctx := run.ctx
 
-	// flushCtx 刻意保留取消前的 ctx，专供 flushScanBatch 写库使用。
-	// 取消时要把已提取的成果落库（见提取循环收尾），若沿用下面派生的可取消 ctx，
+	// flushCtx 刻意脱离取消信号，专供 flushScanBatch 写库使用。
+	// 用户取消时要把已提取的成果落库（见提取循环收尾），若沿用可取消 ctx，
 	// 事务会立刻失败、重试三次后全部记为 failed——「取消保留成果」会静默不生效。
-	// 单批写入很短，不随取消中断也不会拖住取消响应。
-	flushCtx := ctx
+	// 配置发布停止时则在更上层直接跳过 flush（abandoned），不会走到写库。
+	flushCtx := context.WithoutCancel(ctx)
 
-	// 派生可取消 ctx：用户取消时同步 cancel，使 CUE 切分阶段的 ffmpeg 子进程
-	// （exec.CommandContext）被及时杀掉，而非等其自然结束。
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// 用户取消与配置发布都会 cancel run.ctx，使遍历/CUE 阶段的 ffprobe 子进程
+	// （exec.CommandContext）被及时杀掉；发布停止额外置 abandoned 屏障。
 	go func() {
 		select {
-		case <-cancelCh:
-			cancel()
+		case <-run.switchCh:
+			run.abandoned.Store(true)
+			run.cancelFn()
+		case <-run.userCancel:
+			run.cancelFn()
 		case <-ctx.Done():
 		}
 	}()
 
-	scanResult, err := s.scanner.Load().ScanFilesWithCueInDirs(ctx, scopeRoots, func(count int) {
+	if run.scanner == nil {
+		s.scanProgressManager.Fail(fmt.Errorf("扫描器未初始化"))
+		return
+	}
+
+	scanResult, err := run.scanner.ScanFilesWithCueInDirs(ctx, scopeRoots, func(count int) {
 		s.scanProgressManager.SetDiscoveredFiles(count)
 	})
 	if err != nil {
+		if s.terminalizeIfStopped(run) {
+			return
+		}
 		s.scanProgressManager.Fail(fmt.Errorf("failed to scan files: %w", err))
+		return
+	}
+	if s.terminalizeIfStopped(run) {
 		return
 	}
 	files := scanResult.AudioFiles
 
-	select {
-	case <-cancelCh:
-		s.scanProgressManager.SetCancelled()
-		return
-	default:
-	}
-
 	s.scanProgressManager.SetTotalFiles(len(files))
 
-	s.deduplicateLocalSongPaths(ctx)
+	s.deduplicateLocalSongPaths(ctx, run.scanner)
 
 	existingPaths, err := s.songs.ListLocalPaths(ctx)
 	if err != nil {
@@ -626,11 +708,8 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 
 	toProcess := make([]scanProcessItem, 0, len(files))
 	for _, filePath := range files {
-		select {
-		case <-cancelCh:
-			s.scanProgressManager.SetCancelled()
+		if s.terminalizeIfStopped(run) {
 			return
-		default:
 		}
 
 		info, exists := existingPaths[filePath]
@@ -671,22 +750,24 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 		s.scanProgressManager.SetCleanedFiles(cleanedCount)
 	}
 
+	// 后续所有阶段共用的收尾闸门：用户取消保留成果走 CUE/歌单前的原检查点，
+	// 配置发布则任何阶段都立即终止且不产生副作用。
 	if len(toProcess) == 0 {
-		s.runCueProcessing(ctx, scanResult, files, reimport, scopeRoots)
-		select {
-		case <-cancelCh:
-			s.scanProgressManager.SetCancelled()
+		s.runCueProcessing(run, scanResult, files, reimport, scopeRoots)
+		if s.terminalizeIfStopped(run) {
 			return
-		default:
 		}
 		if s.configService != nil && s.configService.GetBool("scan_auto_create_playlists", true) {
-			s.runAutoCreatePlaylists(ctx)
+			s.runAutoCreatePlaylists(run)
 		} else {
 			slog.Info("auto-create playlists disabled, skipping")
 		}
+		if s.terminalizeIfStopped(run) {
+			return
+		}
 		s.setLocalSongCount(ctx)
 		s.scanProgressManager.Complete()
-		s.runAutoFingerprint()
+		s.runAutoFingerprint(run)
 		return
 	}
 
@@ -700,7 +781,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 			defer wg.Done()
 			for item := range inputCh {
 				select {
-				case <-cancelCh:
+				case <-ctx.Done():
 					return
 				default:
 				}
@@ -749,7 +830,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 
 				var fileSize int64
 				var fileModTime time.Time
-				if fileInfo, err := s.scanner.Load().GetFileInfo(item.filePath); err == nil {
+				if fileInfo, err := run.scanner.GetFileInfo(item.filePath); err == nil {
 					fileSize = fileInfo.Size
 					fileModTime = fileInfo.ModTime
 				}
@@ -762,7 +843,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 					fileModTime:      fileModTime,
 					extractionFailed: extractionFailed,
 				}:
-				case <-cancelCh:
+				case <-ctx.Done():
 					return
 				}
 			}
@@ -774,7 +855,7 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 		for _, item := range toProcess {
 			select {
 			case inputCh <- item:
-			case <-cancelCh:
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -789,57 +870,60 @@ func (s *SongService) doScanAndImport(ctx context.Context, reimport bool, scopeR
 	// 全量累积会让几万首的曲库在整个提取阶段（数十分钟）里进度恒为 0、
 	// 数据库一条不写，用户只能判定为卡死（songloft-org/songloft#447）。
 	acc := newScanBatchAccumulator(toProcess, scanDirGroupCap)
-	cancelled := false
+	userCancelled := false
 	for result := range resultCh {
+		// 发布边界已落下：继续排空 worker（否则它们可能阻塞在发送上无法退出），
+		// 但所有旧代结果一律丢弃——发现/已提取/待批量提交的都不允许越过边界写库。
+		if run.switched() {
+			continue
+		}
 		select {
-		case <-cancelCh:
-			cancelled = true
+		case <-run.userCancel:
+			userCancelled = true
 		default:
 		}
-		// 取消后仍收下已提取的结果：worker 正在退出，这些元数据已经花掉了 IO 与 CPU，
+		// 用户取消后仍收下已提取的结果：worker 正在退出，这些元数据已经花掉了 IO 与 CPU，
 		// 丢弃等于让用户白干（#447 的用户连续取消两次，每次作废十分钟的提取）。
 		acc.add(result)
 		for batch := acc.takeBatch(dbBatchSize, false); batch != nil; batch = acc.takeBatch(dbBatchSize, false) {
-			s.flushScanBatch(flushCtx, batch)
+			s.flushScanBatch(flushCtx, run, batch)
 		}
 	}
 
-	// 取消时 pending 永远归不了零，这里把未提取完的目录组也按现有样本定稿冲出来。
+	// 发布停止：不 seal、不 flush、不进 CUE/歌单/指纹阶段，直接终态化退出。
+	if run.switched() {
+		s.scanProgressManager.SetStoppedExternally()
+		return
+	}
+
+	// 用户取消时 pending 永远归不了零，这里把未提取完的目录组也按现有样本定稿冲出来。
 	acc.sealAll()
 	for batch := acc.takeBatch(dbBatchSize, true); batch != nil; batch = acc.takeBatch(dbBatchSize, true) {
-		s.flushScanBatch(flushCtx, batch)
+		s.flushScanBatch(flushCtx, run, batch)
 	}
 
-	if cancelled {
+	if userCancelled {
 		s.scanProgressManager.SetCancelled()
 		return
-	}
-
-	select {
-	case <-cancelCh:
-		s.scanProgressManager.SetCancelled()
-		return
-	default:
 	}
 
 	// CUE 整轨处理
-	s.runCueProcessing(ctx, scanResult, files, reimport, scopeRoots)
-
-	select {
-	case <-cancelCh:
-		s.scanProgressManager.SetCancelled()
+	s.runCueProcessing(run, scanResult, files, reimport, scopeRoots)
+	if s.terminalizeIfStopped(run) {
 		return
-	default:
 	}
 
 	if s.configService != nil && s.configService.GetBool("scan_auto_create_playlists", true) {
-		s.runAutoCreatePlaylists(ctx)
+		s.runAutoCreatePlaylists(run)
 	} else {
 		slog.Info("auto-create playlists disabled, skipping")
 	}
+	if s.terminalizeIfStopped(run) {
+		return
+	}
 	s.setLocalSongCount(ctx)
 	s.scanProgressManager.Complete()
-	s.runAutoFingerprint()
+	s.runAutoFingerprint(run)
 }
 
 // setLocalSongCount 查询 DB 中本地歌曲总数并写入扫描进度，供前端展示。
@@ -854,18 +938,23 @@ func (s *SongService) setLocalSongCount(ctx context.Context) {
 
 // runCueProcessing 执行 CUE 处理阶段（外部 .cue + FLAC 内嵌 CUESHEET），
 // 并清理失效的 CUE 记录。仅解析元数据和入库，播放时按需提取。
-func (s *SongService) runCueProcessing(ctx context.Context, scanResult *ScanResult, files []string, reimport bool, scopeRoots []string) {
+// 发布边界落下后整个阶段不启动、不写库（旧代 CUE 结果不能越过边界）。
+func (s *SongService) runCueProcessing(run *scanRun, scanResult *ScanResult, files []string, reimport bool, scopeRoots []string) {
+	if run.abandoned.Load() {
+		return
+	}
 	s.scanProgressManager.BeginSplittingCue()
-	s.processCueFiles(ctx, scanResult.CueFiles, reimport)
-	s.processEmbeddedCueSheets(ctx, files, reimport)
-	s.cleanStaleCueRecords(ctx, scopeRoots)
+	s.processCueFiles(run, scanResult.CueFiles, reimport)
+	s.processEmbeddedCueSheets(run, files, reimport)
+	if !run.abandoned.Load() {
+		s.cleanStaleCueRecords(run.ctx, scopeRoots)
+	}
 }
 
 // deduplicateLocalSongPaths 规范化非绝对路径的本地歌曲 file_path，
 // 修复因历史版本 music_path 配置变更导致的同一文件存在相对/绝对两条记录的问题。
 // 有绝对路径副本的删除相对路径行；无副本的 UPDATE 为绝对路径。
-func (s *SongService) deduplicateLocalSongPaths(ctx context.Context) {
-	sc := s.scanner.Load()
+func (s *SongService) deduplicateLocalSongPaths(ctx context.Context, sc *Scanner) {
 	if sc == nil {
 		return
 	}
@@ -930,10 +1019,12 @@ func (s *SongService) deduplicateLocalSongPaths(ctx context.Context) {
 
 // runAutoCreatePlaylists 扫描完成后按当前 playlistMode 配置重建 auto_created 歌单。
 // 失败仅记录日志，不影响扫描的「完成」状态——下次扫描会再次尝试。
-func (s *SongService) runAutoCreatePlaylists(ctx context.Context) {
-	if s.playlistAutoCreator == nil {
+// 配置发布落下边界（run.abandoned）后绝不执行——旧任务不得再创建歌单。
+func (s *SongService) runAutoCreatePlaylists(run *scanRun) {
+	if s.playlistAutoCreator == nil || run.abandoned.Load() {
 		return
 	}
+	ctx := run.ctx
 	s.scanProgressManager.BeginCreatingPlaylists()
 
 	playlistMode := models.PlaylistModeDirectory
@@ -951,10 +1042,9 @@ func (s *SongService) runAutoCreatePlaylists(ctx context.Context) {
 	if s.metadataExtractor != nil {
 		coverStoragePath = s.metadataExtractor.CoverStoragePath()
 	}
-	var musicPath string
-	if sc := s.scanner.Load(); sc != nil {
-		musicPath = sc.GetMusicPath()
-	}
+	// 音乐根目录取本扫描启动时捕获的 Scanner，不回读当前 binding——
+	// 该函数能执行就说明本次发布未切换，二者此刻必然一致。
+	musicPath := run.scanner.GetMusicPath()
 	if _, err := s.playlistAutoCreator.AutoCreate(ctx, playlistMode, autoCreateExcludeDirs, coverStoragePath, musicPath); err != nil {
 		slog.Warn("自动创建歌单失败", "playlist_mode", playlistMode, "error", err)
 	}
@@ -963,7 +1053,13 @@ func (s *SongService) runAutoCreatePlaylists(ctx context.Context) {
 // runAutoFingerprint 扫描完成后自动为缺失指纹的歌曲计算指纹。
 // 默认关闭：指纹只服务于「重复歌曲检测」与插件歌词/封面搜索，属按需功能，
 // 全库自动计算会在扫描「完成」之后继续长时间占满 CPU（songloft-org/songloft#323）。
-func (s *SongService) runAutoFingerprint() {
+// 配置发布落下边界后绝不启动——旧任务不得再触发指纹计算；发布流程还会额外
+// Cancel() 掉扫描尾部已经异步启动的指纹任务。
+func (s *SongService) runAutoFingerprint(run *scanRun) {
+	if run.abandoned.Load() {
+		slog.Info("auto fingerprint skipped: scan generation superseded")
+		return
+	}
 	// 注意判定方向：configService 缺失时也必须跳过（默认关闭），
 	// 不能写成 `configService != nil && !GetBool(...)`——那样注入缺失反而会放行全库计算。
 	if s.configService == nil || !s.configService.GetBool("scan_auto_fingerprint", false) {
@@ -1030,7 +1126,11 @@ func fixSpamTags(results []scanExtractResult) {
 
 // flushScanBatch 批量处理扫描结果，使用事务提高写入效率
 // 将多条数据库操作合并在同一事务中提交，减少磁盘fsync次数和WAL刷写开销
-func (s *SongService) flushScanBatch(ctx context.Context, batch []scanExtractResult) {
+func (s *SongService) flushScanBatch(ctx context.Context, run *scanRun, batch []scanExtractResult) {
+	// 发布边界落下后，任何等待批量提交的旧代结果都不允许再写库，也不更新进度。
+	if run.abandoned.Load() {
+		return
+	}
 	if s.tx == nil {
 		slog.Error("flushScanBatch 缺少事务执行器,跳过批次")
 		for _, r := range batch {
@@ -1363,7 +1463,7 @@ func (s *SongService) CleanInvalidSongs(ctx context.Context) (*CleanResult, erro
 		shouldClean := false
 		reason := ""
 
-		scanner := s.scanner.Load()
+		scanner := s.Scanner()
 		if _, err := os.Stat(song.FilePath); os.IsNotExist(err) {
 			shouldClean = true
 			reason = "file_not_found"
@@ -1600,7 +1700,7 @@ type organizePlan struct {
 
 // resolveMusicPath 返回当前 music_path；未配置时报错。
 func (s *SongService) resolveMusicPath() (string, error) {
-	scanner := s.scanner.Load()
+	scanner := s.Scanner()
 	if scanner == nil {
 		return "", fmt.Errorf("music_path 未配置")
 	}

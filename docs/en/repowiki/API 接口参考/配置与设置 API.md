@@ -47,7 +47,7 @@ Songloft has two categories of configuration interfaces, and user-facing feature
 | **Business settings** | `/settings/<name>` | User-facing feature switches | Strongly-typed JSON, built-in defaults, triggers side effects after PUT |
 | **Generic KV** | `/configs/{key}` | Admin editor only | Pure string KV, PUT returns 404 when the key does not exist, no defaults |
 
-Client business features always go through the `/settings/*` endpoints (`SettingsApi`); `/configs/{key}` is used only by the frontend `config_manager.dart` generic configuration editor (`ConfigApi`). Both can read/write the same underlying config key (dual entry retained), and side effects are triggered uniformly by the `configHandler.SetOnConfigChanged` callback.
+Client business features always go through the `/settings/*` endpoints (`SettingsApi`); `/configs/{key}` is used only by the frontend `config_manager.dart` generic configuration editor (`ConfigApi`). Both can read/write the same underlying config key (dual entry retained): `music_path` is intercepted by `beforeConfigChange` and goes through the synchronous SongService.PublishMusicPath boundary, while other keys use the asynchronous `onConfigChanged` callback.
 
 ---
 
@@ -93,7 +93,7 @@ Gets a single configuration.
 
 ### PUT /api/v1/configs/{key}
 
-Updates an existing configuration. The configuration must already exist, otherwise it returns 404. After the update, asynchronously triggers the `onConfigChanged` callback (`music_path` rebuilds the Scanner, `auto_scan` restarts the scheduler).
+Updates an existing configuration. The configuration must already exist, otherwise it returns 404. After the update, asynchronously triggers the `onConfigChanged` callback (`auto_scan` restarts the scheduler); `music_path` is the exception — it is intercepted before persistence by `beforeConfigChange` and goes through the synchronous publish boundary (stop old scan, clean with the new rules, persist, swap Scanner).
 
 - **Authentication**: Bearer Token
 - **Path parameter**: `key` (string)
@@ -138,7 +138,7 @@ All business settings endpoints follow a uniform pattern: GET returns the curren
 | `exclude_dirs` | string[] | `["@eaDir","tmp"]` | Exclude by directory name |
 | `exclude_paths` | string[] | `[]` | Exclude by full path |
 
-- **PUT side effect**: Asynchronously triggers `onMusicPathChanged` (rebuilds the Scanner + cleans up songs in excluded directories)
+- **PUT side effect**: Runs the synchronous config publish (PublishMusicPath): stops and joins the old scan, cleans the library with the new rules, persists the new generation and atomically swaps the Scanner; success is returned only after every step succeeds
 - **400**: Empty path | **500**: Save failed
 
 ### 3.2 HLS Proxy Switch
@@ -173,7 +173,7 @@ Disabled by default, with an interval of 3600 seconds (1 hour). PUT validates th
 
 After switching, a scan in "re-import" mode is required for it to take effect.
 
-- **PUT side effect**: Asynchronously triggers a Scanner rebuild
+- **PUT side effect**: Asynchronously refreshes the metadata title source only (no Scanner rebuild, no scan stop)
 - **400**: title_source is not `tag` or `filename`
 
 ### 3.5 Scan Auto-Create Playlists

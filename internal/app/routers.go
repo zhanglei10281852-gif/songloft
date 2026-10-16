@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -47,7 +49,14 @@ func (a *App) setupAPIV1Router() {
 		hlsHandler,
 		a.playActivity,
 	)
-	songHandler.SetGetMusicPath(a.scanner.GetMusicPath)
+	// 用闭包读取「当前已发布」的扫描器，不能直接传 a.scanner.GetMusicPath 方法值——
+	// 方法值在启动时绑定旧 Scanner，配置发布重建后 SongHandler 会一直读到旧音乐根目录。
+	songHandler.SetGetMusicPath(func() string {
+		if sc := a.songService.Scanner(); sc != nil {
+			return sc.GetMusicPath()
+		}
+		return ""
+	})
 	songHandler.SetPlayBroadcaster(&playEventBroadcastAdapter{m: a.jsPluginManager})
 	songHandler.SetLyricSearcher(a.jsPluginManager)
 	songHandler.SetCoverSearcher(a.jsPluginManager)
@@ -68,18 +77,36 @@ func (a *App) setupAPIV1Router() {
 	scanHandler.SetFingerprintService(fingerprintService)
 	a.songService.SetFingerprintService(fingerprintService)
 
-	// music_path 写后回调：重建 Scanner 并清理排除目录中的歌曲。
-	// 两条入口都触发同一副作用，保持 admin /configs PUT 与业务 /settings/music-path PUT 行为对齐。
-	musicPathChanged := func() { a.onMusicPathConfigChanged(scanHandler) }
-	scanHandler.SetOnMusicPathChanged(musicPathChanged)
+	// music_path 的两条写入口（业务端点 /settings/music-path 与 admin /configs PUT）
+	// 统一走同步「配置发布」：停旧扫描 → 新规则清理曲库 → 落库新一代配置 → 原子切换
+	// Scanner，全部成功后接口才返回成功。handler 侧的 scanner 引用在 afterSwap 中刷新。
+	publishMusicPath := func(ctx context.Context, cfg services.MusicPathConfig) (uint64, error) {
+		return a.songService.PublishMusicPath(ctx, cfg, func(sc *services.Scanner) {
+			scanHandler.SetScanner(sc)
+		})
+	}
+	scanHandler.SetMusicPathPublisher(publishMusicPath)
+	scanHandler.SetOnScanTitleSourceChanged(func() {
+		a.metadataExtractor.SetTitleSource(a.configService.GetString("scan_title_source", "tag"))
+	})
 	scanHandler.SetOnAutoScanChanged(func(cfg services.AutoScanConfig) {
 		a.autoScanner.ApplyConfig(cfg)
 	})
+	// admin 通用入口直改 music_path 时，拦截默认落库，改走同一发布流程；
+	// 其余 key（如 auto_scan）维持落库后异步回调。
+	configHandler.SetBeforeConfigChange(func(key, value string) (bool, error) {
+		if key != "music_path" {
+			return false, nil
+		}
+		var cfg services.MusicPathConfig
+		if err := json.Unmarshal([]byte(value), &cfg); err != nil {
+			return true, fmt.Errorf("music_path 配置 JSON 解析失败: %w", err)
+		}
+		_, err := publishMusicPath(context.Background(), cfg)
+		return true, err
+	})
 	configHandler.SetOnConfigChanged(func(key string) {
-		switch key {
-		case "music_path":
-			musicPathChanged()
-		case "auto_scan":
+		if key == "auto_scan" {
 			cfg := a.autoScanner.GetConfig()
 			a.autoScanner.ApplyConfig(cfg)
 		}

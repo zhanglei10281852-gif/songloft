@@ -5055,7 +5055,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "写入 music_path 配置并触发 Scanner 重建 + 清理排除目录中的歌曲（与 admin /configs PUT 的副作用一致）。",
+                "description": "以\"配置发布边界\"语义同步应用：成功响应返回前，使用旧配置的在跑手动/自动扫描必须停止接收新工作并完成收尾（旧结果不再写库、不建歌单、不触发指纹），随后按新规则清除已脱离音乐根目录或进入排除范围的记录（即使旧文件仍存在），最后持久化新一代配置并原子切换 Scanner。任一步骤失败都返回错误且旧配置继续完整可用，不会留下持久配置、内存扫描器与曲库不一致的中间状态；服务重启后也只恢复最后成功发布的那一代。",
                 "consumes": [
                     "application/json"
                 ],
@@ -5094,7 +5094,7 @@
                         }
                     },
                     "500": {
-                        "description": "保存配置失败",
+                        "description": "停止旧扫描、清理曲库或保存配置失败（旧配置仍可用）",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -10210,6 +10210,9 @@
                     "items": {
                         "type": "string"
                     }
+                },
+                "generation": {
+                    "type": "integer"
                 },
                 "path": {
                     "type": "string"

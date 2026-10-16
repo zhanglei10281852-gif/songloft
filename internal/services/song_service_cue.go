@@ -17,14 +17,18 @@ import (
 )
 
 // processCueFiles 处理外部 .cue 文件：解析、入库（按需提取替代预分割）。
-func (s *SongService) processCueFiles(ctx context.Context, cueFiles []string, reimport bool) {
+func (s *SongService) processCueFiles(run *scanRun, cueFiles []string, reimport bool) {
 	if len(cueFiles) == 0 {
 		return
 	}
+	ctx := run.ctx
 
 	existingSources := s.listCueSourceSet(ctx)
 
 	for _, cuePath := range cueFiles {
+		if run.abandoned.Load() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -43,15 +47,19 @@ func (s *SongService) processCueFiles(ctx context.Context, cueFiles []string, re
 			continue
 		}
 
-		s.processCueSheet(ctx, cuePath, sheet, reimport)
+		s.processCueSheet(run, cuePath, sheet, reimport)
 	}
 }
 
 // processEmbeddedCueSheets 检测 FLAC 文件中的内嵌 CUESHEET block。
-func (s *SongService) processEmbeddedCueSheets(ctx context.Context, audioFiles []string, reimport bool) {
+func (s *SongService) processEmbeddedCueSheets(run *scanRun, audioFiles []string, reimport bool) {
+	ctx := run.ctx
 	existingSources := s.listCueSourceSet(ctx)
 
 	for _, filePath := range audioFiles {
+		if run.abandoned.Load() {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -112,7 +120,7 @@ func (s *SongService) processEmbeddedCueSheets(ctx context.Context, audioFiles [
 		}
 
 		// 对于内嵌 CUESHEET，cueSourcePath 是 FLAC 文件本身
-		s.processCueSheet(ctx, filePath, sheet, reimport)
+		s.processCueSheet(run, filePath, sheet, reimport)
 	}
 }
 
@@ -154,7 +162,13 @@ func secondsToCueTime(seconds float64) cue.CUETime {
 
 // processCueSheet 处理一个 CUE Sheet：解析 track 起止时间并入库。
 // 不再预分割音频文件；播放时由 CacheService 按需提取。
-func (s *SongService) processCueSheet(ctx context.Context, cueSourcePath string, sheet *cue.CUESheet, reimport bool) {
+// 发布边界落下后（run.abandoned）直接返回：处理中的旧 CUE 结果不得越过边界写库，
+// 也不得再更新扫描进度。
+func (s *SongService) processCueSheet(run *scanRun, cueSourcePath string, sheet *cue.CUESheet, reimport bool) {
+	if run.abandoned.Load() {
+		return
+	}
+	ctx := run.ctx
 	s.scanProgressManager.UpdateCueProgress(cueSourcePath)
 
 	cueDir := filepath.Dir(cueSourcePath)
@@ -186,6 +200,9 @@ func (s *SongService) processCueSheet(ctx context.Context, cueSourcePath string,
 
 	// 重新导入时先删除旧记录
 	if reimport {
+		if run.abandoned.Load() {
+			return
+		}
 		if n, err := s.songs.DeleteByCueSource(ctx, cueSourcePath); err == nil && n > 0 {
 			slog.Info("重新导入 CUE，删除旧记录", "source", cueSourcePath, "deleted", n)
 		}
@@ -242,6 +259,10 @@ func (s *SongService) processCueSheet(ctx context.Context, cueSourcePath string,
 		songs = append(songs, song)
 	}
 
+	// 批量入库前最后一道屏障：提取/解析期间发布边界可能已落下。
+	if run.abandoned.Load() {
+		return
+	}
 	// 批量入库
 	err = s.tx.RunInTx(ctx, func(ctx context.Context, uow *database.UnitOfWork) error {
 		for _, song := range songs {

@@ -47,7 +47,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端�
 | **业务设置** | `/settings/<name>` | 用户可见功能开关 | 强类型 JSON、自带默认值、PUT 后触发副作用 |
 | **通用 KV** | `/configs/{key}` | admin 编辑器专用 | 纯字符串 KV、PUT 时 key 不存在返回 404、无默认值 |
 
-客户端业务功能一律走 `/settings/*` 端点（`SettingsApi`）；`/configs/{key}` 仅供前端 `config_manager.dart` 通用配置编辑器使用（`ConfigApi`）。两者可读写同一底层 config key（保留双入口），副作用由 `configHandler.SetOnConfigChanged` 回调统一触发。
+客户端业务功能一律走 `/settings/*` 端点（`SettingsApi`）；`/configs/{key}` 仅供前端 `config_manager.dart` 通用配置编辑器使用（`ConfigApi`）。两者可读写同一底层 config key（保留双入口）：`music_path` 由 `beforeConfigChange` 拦截后走 SongService.PublishMusicPath 同步发布，其余 key 由 `onConfigChanged` 异步回调。
 
 ---
 
@@ -93,7 +93,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端�
 
 ### PUT /api/v1/configs/{key}
 
-更新已有配置。配置必须已存在，否则返回 404。更新后异步触发 `onConfigChanged` 回调（`music_path` 重建 Scanner，`auto_scan` 重启调度）。
+更新已有配置。配置必须已存在，否则返回 404。更新后异步触发 `onConfigChanged` 回调（`auto_scan` 重启调度）；`music_path` 例外——落库前被 `beforeConfigChange` 拦截，改走同步的配置发布边界（停旧扫描 → 按新规则清理 → 落库 → 换 Scanner）。
 
 - **认证**: Bearer Token
 - **路径参数**: `key`（string）
@@ -138,7 +138,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端�
 | `exclude_dirs` | string[] | `["@eaDir","tmp"]` | 按目录名排除 |
 | `exclude_paths` | string[] | `[]` | 按完整路径排除 |
 
-- **PUT 副作用**: 异步触发 `onMusicPathChanged`（重建 Scanner + 清理排除目录歌曲）
+- **PUT 副作用**: 同步执行配置发布（PublishMusicPath）：停旧扫描并 join、按新规则清理曲库、落库新一代配置、原子切换 Scanner，全部成功才返回
 - **400**: path 为空 | **500**: 保存失败
 
 ### 3.2 HLS 代理开关
@@ -173,7 +173,7 @@ Songloft 有两类配置接口，用户可见的功能开关一律走业务端�
 
 切换后需以"重新导入"模式扫描才能生效。
 
-- **PUT 副作用**: 异步触发 Scanner 重建
+- **PUT 副作用**: 异步刷新元数据标题来源（不重建 Scanner、不停止扫描）
 - **400**: title_source 不是 `tag` 或 `filename`
 
 ### 3.5 扫描自动创建歌单

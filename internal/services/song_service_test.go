@@ -165,7 +165,8 @@ func TestRunAutoCreatePlaylistsReadsConfig(t *testing.T) {
 	stub := &stubPlaylistAutoCreator{}
 	service := NewSongService(repo, nil, nil, nil, configService, stub)
 
-	service.runAutoCreatePlaylists(context.Background())
+	run := newDirectScanRun(t, NewScanner(&ScanConfig{MusicPath: "music"}))
+	service.runAutoCreatePlaylists(run)
 
 	if stub.calls != 1 {
 		t.Fatalf("AutoCreate calls = %d, want 1", stub.calls)
@@ -182,7 +183,8 @@ func TestRunAutoCreatePlaylistsReadsConfig(t *testing.T) {
 func TestRunAutoCreatePlaylistsSkipsWhenNil(t *testing.T) {
 	repo := newTestSongRepo(t)
 	service := NewSongService(repo, nil, nil, nil, nil, nil)
-	service.runAutoCreatePlaylists(context.Background())
+	run := newDirectScanRun(t, nil)
+	service.runAutoCreatePlaylists(run)
 	if got := service.scanProgressManager.GetProgress().Status; got == ScanStatusCreatingPlaylists {
 		t.Errorf("scan status should not be creating_playlists when stub absent")
 	}
